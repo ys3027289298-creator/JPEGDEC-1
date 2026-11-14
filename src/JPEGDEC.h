@@ -63,6 +63,9 @@
 #define MAX_COMPS_IN_SCAN 4
 #define MAX_BUFFERED_PIXELS 2048
 #define MCU_SKIP -8
+// Worst-case size (in bytes) of one emitted pixel block:
+// 2048 RGB565 pixels / 4096 grayscale pixels / 1024 RGB8888 pixels
+#define MAX_ROTATE_BUF_BYTES 4096
 
 // Decoder options
 #define JPEG_AUTO_ROTATE 1
@@ -205,6 +208,7 @@ typedef struct jpeg_image_tag
     int iCropX, iCropY, iCropCX, iCropCY; // crop area
     uint8_t ucBpp, ucSubSample, ucHuffTableUsed;
     uint8_t ucMode, ucOrientation, ucHasThumb, b11Bit;
+    uint8_t ucRotation; // EXIF rotation code: 0=0deg, 1=90CW, 2=180, 3=270CW
     uint8_t ucComponentsInScan, cApproxBitsLow, cApproxBitsHigh;
     uint8_t iScanStart, iScanEnd, ucFF, ucNumComponents;
     uint8_t ucACTable, ucDCTable;
@@ -236,6 +240,7 @@ typedef struct jpeg_image_tag
     uint8_t ucFileBuf[JPEG_FILE_BUF_SIZE]; // holds temp data and pixel stack
     uint8_t ucHuffDC[DC_TABLE_SIZE * 2]; // up to 2 'short' tables
     uint16_t usHuffAC[HUFF11SIZE * 2];
+    uint8_t ucRotateBuf[MAX_ROTATE_BUF_BYTES]; // scratch for JPEG_AUTO_ROTATE
 } JPEGIMAGE;
 
 #ifdef __cplusplus

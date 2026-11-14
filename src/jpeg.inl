@@ -1310,9 +1310,11 @@ static uint32_t TIFFLONG(unsigned char *p, int bMotorola)
     uint32_t l;
 
     if (bMotorola)
-        l = *p * 0x1000000 + *(p+1) * 0x10000 + *(p+2) * 0x100 + *(p+3); // big endian
+        l = ((uint32_t)*p << 24) + ((uint32_t)*(p+1) << 16) +
+            ((uint32_t)*(p+2) << 8) + (uint32_t)*(p+3); // big endian
     else
-        l = *p + *(p+1) * 0x100 + *(p+2) * 0x10000 + *(p+3) * 0x1000000; // little endian
+        l = (uint32_t)*p + ((uint32_t)*(p+1) << 8) +
+            ((uint32_t)*(p+2) << 16) + ((uint32_t)*(p+3) << 24); // little endian
     return l;
 } /* TIFFLONG() */
 //
@@ -1359,10 +1361,14 @@ static void GetTIFFInfo(JPEGIMAGE *pPage, int bMotorola, int iOffset)
     int iTag, iTagCount, i;
     uint8_t *cBuf = pPage->ucFileBuf;
     
-    if (iOffset + 2 >= JPEG_FILE_BUF_SIZE) return;
+    if (iOffset < 0 || iOffset + 2 >= JPEG_FILE_BUF_SIZE) return;
     iTagCount = TIFFSHORT(&cBuf[iOffset], bMotorola);  /* Number of tags in this dir */
     if (iTagCount < 1 || iTagCount > 256) // invalid tag count
         return; /* Bad header info */
+    // Every 12-byte tag entry plus the trailing 4-byte next-IFD pointer
+    // must fit inside the file buffer, otherwise the entries are bogus.
+    if (iOffset + 2 + (iTagCount * 12) + 4 > JPEG_FILE_BUF_SIZE)
+        return;
     /*--- Search the TIFF tags ---*/
     for (i=0; i<iTagCount; i++)
     {
@@ -1672,7 +1678,12 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
                     bMotorola = (s[iOffset+8] == 'M');
                     IFD = TIFFLONG(&s[iOffset+12], bMotorola);
                     iTagCount = TIFFSHORT(&s[iOffset+16], bMotorola);
-                    if (IFD != 0 && (IFD + iOffset + 8) < JPEG_FILE_BUF_SIZE) {
+                    // IFD is an offset relative to the TIFF header (which
+                    // starts at iOffset+8). Reject values that would read
+                    // past the buffered data instead of trusting a signed
+                    // wrap-around comparison.
+                    if (IFD != 0 && (int)IFD < JPEG_FILE_BUF_SIZE &&
+                        (int)IFD + iOffset + 8 < iBytesRead) {
                         GetTIFFInfo(pPage, bMotorola, IFD+iOffset+8);
                     }
                     // The second IFD defines the thumbnail (if present)
@@ -1680,8 +1691,13 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
                     {
                        // point to next IFD
                         IFD += (12 * iTagCount) + 2;
-                        IFD = TIFFLONG(&s[IFD + iOffset + 8], bMotorola);
-                        if (IFD != 0 && IFD + iOffset + 8 < JPEG_FILE_BUF_SIZE) // Thumbnail present?
+                        if (IFD + iOffset + 12 <= iBytesRead) {
+                            IFD = TIFFLONG(&s[IFD + iOffset + 8], bMotorola);
+                        } else {
+                            IFD = 0; // next-IFD pointer not fully present
+                        }
+                        if (IFD != 0 && (int)IFD < JPEG_FILE_BUF_SIZE &&
+                            (int)IFD + iOffset + 8 < iBytesRead) // Thumbnail present?
                         {
                             pPage->ucHasThumb = 1;
                             GetTIFFInfo(pPage, bMotorola, IFD+iOffset+8); // info for second 'page' of TIFF
@@ -5015,6 +5031,95 @@ uint8_t pixelmask=0, shift=0;
     } // for y
 } /* JPEGDither() */
 
+// Map the raw EXIF Orientation tag (1..8) to a rotation code suitable for
+// uint8_t storage: 0=0 degrees, 1=90 CW, 2=180, 3=270 CW.
+// Mirrored orientations (2,4,5,7) cannot be expressed as a rotation and
+// any out-of-range value is treated as "no rotation" so the decoded pixels
+// are left untouched.
+static int JPEGOrientationToCode(int iOrientation)
+{
+    static const int iCode[9] = {
+        0,   // 0 = tag absent/invalid
+        0,   // 1 = normal
+        0,   // 2 = mirrored horizontal (not a pure rotation)
+        2,   // 3 = rotated 180
+        0,   // 4 = mirrored vertical (not a pure rotation)
+        0,   // 5 = mirrored and rotated 90 CW (not a pure rotation)
+        1,   // 6 = rotated 90 CW
+        0,   // 7 = mirrored and rotated 270 CW (not a pure rotation)
+        3    // 8 = rotated 270 CW (90 CCW)
+    };
+    if (iOrientation < 1 || iOrientation > 8)
+        return 0;
+    return iCode[iOrientation];
+} /* JPEGOrientationToCode() */
+
+// Convert a rotation code back to clockwise degrees.
+static int JPEGRotationCodeToAngle(int iCode)
+{
+    static const int iAngle[4] = {0, 90, 180, 270};
+    return iAngle[iCode & 3];
+} /* JPEGRotationCodeToAngle() */
+
+//
+// Rotate one emitted pixel block (the contents of a JPEGDRAW callback)
+// into pJPEG->ucRotateBuf and report the new geometry/placement.
+// Source pixels are read from pPixels; iSrcPitch is the source line
+// pitch measured in PIXELS and iPixelBytes is the pixel size in bytes
+// (1 = 8-bit gray, 2 = RGB565, 4 = RGB8888).
+// iWidth/iHeight are the valid (already clipped) pixel counts.
+//
+static void JPEGRotateBlock(JPEGIMAGE *pJPEG, uint8_t *pPixels,
+                            int iSrcPitch, int iWidth, int iHeight,
+                            int iPixelBytes)
+{
+    uint8_t *pOut = pJPEG->ucRotateBuf;
+    int iAngle = JPEGRotationCodeToAngle((int)pJPEG->ucRotation);
+    int iOutW, iOutH, dx, dy, sx, sy;
+
+    if (iAngle == 90 || iAngle == 270) {
+        iOutW = iHeight;
+        iOutH = iWidth;
+    } else {
+        iOutW = iWidth;
+        iOutH = iHeight;
+    }
+    // Typed access avoids a per-pixel memcpy() call and lets the compiler
+    // keep the value in a register (the transpose itself cannot vectorize
+    // across the stride, but scalar 16/32-bit moves are already optimal).
+    for (dy = 0; dy < iOutH; dy++)
+    {
+        for (dx = 0; dx < iOutW; dx++)
+        {
+            if (iAngle == 90) {
+                // 90 CW: output (dx,dy) <- source (iWidth-1-dy,
+                // iHeight-1-dx)
+                sx = iWidth - 1 - dy;
+                sy = iHeight - 1 - dx;
+            } else if (iAngle == 180) {
+                // output (dx,dy) <- source (iWidth-1-dx, iHeight-1-dy)
+                sx = iWidth - 1 - dx;
+                sy = iHeight - 1 - dy;
+            } else { // 270 CW
+                // 270 CW: output (dx,dy) <- source (dy, dx)
+                sx = dy;
+                sy = dx;
+            }
+            int iDst = (dy * iOutW + dx) * iPixelBytes;
+            int iSrc = sy * iSrcPitch + sx; // index in pixels
+            if (iPixelBytes == 1) {
+                pOut[iDst] = pPixels[iSrc];
+            } else if (iPixelBytes == 2) {
+                ((uint16_t *)pOut)[dy * iOutW + dx] =
+                    ((uint16_t *)pPixels)[iSrc];
+            } else {
+                ((uint32_t *)pOut)[dy * iOutW + dx] =
+                    ((uint32_t *)pPixels)[iSrc];
+            }
+        }
+    }
+} /* JPEGRotateBlock() */
+
 //
 // Decode the image
 // returns 0 for error, 1 for success
@@ -5066,6 +5171,20 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     }
     if (pJPEG->iOptions & JPEG_LUMA_ONLY && pJPEG->ucPixelType < EIGHT_BIT_GRAYSCALE) {
         pJPEG->ucPixelType = EIGHT_BIT_GRAYSCALE; // switch to grayscale output
+    }
+    // Resolve EXIF auto-rotation for this decode. It operates on the pixel
+    // blocks handed to the draw callback, so the framebuffer, thumbnail,
+    // cropped and packed-dither paths keep their original (unrotated)
+    // behavior. Mirrored/invalid orientation values map to 0 degrees.
+    pJPEG->ucRotation = 0;
+    if ((pJPEG->iOptions & JPEG_AUTO_ROTATE) &&
+        pJPEG->pFramebuffer == NULL &&
+        !(pJPEG->iOptions & JPEG_EXIF_THUMBNAIL) &&
+        pJPEG->ucPixelType <= EIGHT_BIT_GRAYSCALE &&
+        pJPEG->iCropCX == pJPEG->iWidth &&
+        pJPEG->iCropCY == pJPEG->iHeight)
+    {
+        pJPEG->ucRotation = (uint8_t)JPEGOrientationToCode((int)pJPEG->ucOrientation);
     }
     // reorder and fix the quantization table for decoding
     JPEGFixQuantD(pJPEG);
@@ -5398,7 +5517,52 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                     jd.pPixels = (uint16_t *)pJPEG->pDitherBuffer; 
                 else
                     jd.pPixels = pJPEG->usPixels;
-                bContinue = (*pJPEG->pfnDraw)(&jd);
+                if (pJPEG->ucRotation) { // EXIF auto-rotate this block
+                    int iBlockW = jd.iWidthUsed, iBlockH = jd.iHeight;
+                    // Geometry is computed entirely in SCALED output
+                    // coordinates because jd already reports scaled sizes.
+                    int iSrcOriginX = jd.x - pJPEG->iXOffset;
+                    int iSrcOriginY = jd.y - pJPEG->iYOffset;
+                    int iScaledW = (pJPEG->iWidth + ((1 << iScaleShift) - 1))
+                                   >> iScaleShift;
+                    int iScaledH = (pJPEG->iHeight + ((1 << iScaleShift) - 1))
+                                   >> iScaleShift;
+                    int iPixelBytes = (pJPEG->ucPixelType == RGB8888) ? 4 :
+                                      (pJPEG->ucPixelType == EIGHT_BIT_GRAYSCALE) ? 1 : 2;
+                    int iSaveW = jd.iWidth, iSaveWU = jd.iWidthUsed, iSaveH = jd.iHeight;
+                    int iSaveX = jd.x, iSaveY = jd.y;
+                    uint16_t *pSavePixels = jd.pPixels;
+                    int bSwap = (pJPEG->ucRotation == 1 ||
+                                 pJPEG->ucRotation == 3);
+
+                    JPEGRotateBlock(pJPEG, (uint8_t *)jd.pPixels, iPitch,
+                                    iBlockW, iBlockH, iPixelBytes);
+                    jd.pPixels = (uint16_t *)pJPEG->ucRotateBuf;
+                    if (pJPEG->ucRotation == 1) { // 90 CW
+                        jd.x = pJPEG->iXOffset + (iScaledH - (iSrcOriginY + iBlockH));
+                        jd.y = pJPEG->iYOffset + iSrcOriginX;
+                    } else if (pJPEG->ucRotation == 2) { // 180
+                        jd.x = pJPEG->iXOffset + (iScaledW - (iSrcOriginX + iBlockW));
+                        jd.y = pJPEG->iYOffset + (iScaledH - (iSrcOriginY + iBlockH));
+                    } else { // 270 CW
+                        jd.x = pJPEG->iXOffset + iSrcOriginY;
+                        jd.y = pJPEG->iYOffset + (iScaledW - (iSrcOriginX + iBlockW));
+                    }
+                    if (bSwap) {
+                        jd.iWidth = jd.iWidthUsed = iBlockH;
+                        jd.iHeight = iBlockW;
+                    }
+                    bContinue = (*pJPEG->pfnDraw)(&jd);
+                    // restore the unrotated strip bookkeeping
+                    jd.iWidth = iSaveW;
+                    jd.iWidthUsed = iSaveWU;
+                    jd.iHeight = iSaveH;
+                    jd.x = iSaveX;
+                    jd.y = iSaveY;
+                    jd.pPixels = pSavePixels;
+                } else {
+                    bContinue = (*pJPEG->pfnDraw)(&jd);
+                }
                 iDMAOffset ^= iDMASize; // toggle ping-pong offset
                 jd.x += iPitch;
                 if (pJPEG->iCropCX != (cx * mcuCX) && (iPitch + jd.x) > (pJPEG->iCropX + pJPEG->iCropCX)) { // image is cropped, don't go past end
