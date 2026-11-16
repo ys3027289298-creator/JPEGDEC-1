@@ -832,12 +832,94 @@ static int32_t readFile(JPEGFILE *pFile, uint8_t *pBuf, int32_t iLen)
 // 3rd party dependencies, not even the C runtime library
 //
 //
+// Cancelable decode support
+//
+// A UI can cancel a running decode (e.g. the user navigated away) by setting a
+// flag which the decoder polls after every N decoded MCUs. When canceled, the
+// decode stops, reports how much of the image was completed and - if requested -
+// keeps a checkpoint so that the next JPEG_decode() call continues where it
+// stopped. The checkpoint is a logical MCU position: a resumed decode re-reads
+// the entropy-coded data of the already completed MCUs (Huffman decoding only,
+// no IDCT and no pixel output) to rebuild the exact decoder state, then
+// continues producing pixels from the breakpoint. The output of a
+// canceled+resumed decode is therefore pixel-identical to an uninterrupted one.
+// The check interval (in MCUs) and the resumable behavior are both configurable.
+// Note: the state below supports one cancelable decoder at a time.
+//
+static JPEGIMAGE *s_pCancelJPEG = NULL; // decoder instance the config belongs to
+static volatile int *s_piCancelFlag = NULL; // user-provided flag polled while decoding
+static int s_iCheckInterval = 1; // poll the flag after this many MCUs
+static int s_bResumable = 0; // nonzero = keep a resume checkpoint when canceled
+static int s_iResumeMCU = -1; // MCU index to resume at (-1 = start from the beginning)
+static int s_iMCUsDone = 0; // MCUs completed by the current/last decode
+static int s_iMCUsTotal = 0; // total MCUs of the current image
+static int s_bCanceled = 0; // the last decode ended because it was canceled
+//
+// Disable cancelable decoding and discard any saved resume state
+//
+void JPEG_cancelableDecodeReset(JPEGIMAGE *pJPEG)
+{
+    (void)pJPEG; // the state is global; the parameter is kept for symmetry
+    s_pCancelJPEG = NULL;
+    s_piCancelFlag = NULL;
+    s_iCheckInterval = 1;
+    s_bResumable = 0;
+    s_iResumeMCU = -1;
+    s_iMCUsDone = s_iMCUsTotal = 0;
+    s_bCanceled = 0;
+} /* JPEG_cancelableDecodeReset() */
+//
+// Configure cancelable decoding for a decoder instance.
+// piCancelFlag: pointer to a user flag; decoding cancels when it becomes nonzero
+// iCheckInterval: how often (in MCUs) the flag is polled; values < 1 become 1
+// bResumable: nonzero = a canceled decode can be continued by the next decode call
+// Returns 1 on success, 0 (with iError = JPEG_INVALID_PARAMETER) on bad arguments;
+// invalid arguments leave cancelable decoding disabled.
+//
+int JPEG_cancelableDecodeConfig(JPEGIMAGE *pJPEG, volatile int *piCancelFlag, int iCheckInterval, int bResumable)
+{
+    if (pJPEG == NULL || piCancelFlag == NULL) // invalid cancel flag
+    {
+        if (pJPEG != NULL)
+            pJPEG->iError = JPEG_INVALID_PARAMETER;
+        return 0;
+    }
+    if (iCheckInterval < 1) // invalid interval: poll after every MCU
+        iCheckInterval = 1;
+    s_pCancelJPEG = pJPEG;
+    s_piCancelFlag = piCancelFlag;
+    s_iCheckInterval = iCheckInterval;
+    s_bResumable = (bResumable != 0);
+    s_iResumeMCU = -1;
+    s_iMCUsDone = s_iMCUsTotal = 0;
+    s_bCanceled = 0;
+    return 1;
+} /* JPEG_cancelableDecodeConfig() */
+//
+// Returns 1 if the last decode of this instance ended because it was canceled
+// (as opposed to finishing or failing); getLastError() stays JPEG_SUCCESS then
+//
+int JPEG_decodeWasCanceled(JPEGIMAGE *pJPEG)
+{
+    return (pJPEG != NULL && pJPEG == s_pCancelJPEG && s_bCanceled) ? 1 : 0;
+} /* JPEG_decodeWasCanceled() */
+//
+// Completion ratio of the current/last decode in per-mille (0..1000)
+//
+int JPEG_decodeProgress(JPEGIMAGE *pJPEG)
+{
+    if (pJPEG == NULL || pJPEG != s_pCancelJPEG || s_iMCUsTotal == 0)
+        return 0;
+    return (s_iMCUsDone * 1000) / s_iMCUsTotal;
+} /* JPEG_decodeProgress() */
+//
 // Initialize a JPEG file and callback access from a file on SD or memory
 // returns 1 for success, 0 for failure
 // Fills in the basic image info fields of the JPEGIMAGE structure
 //
 static int JPEGInit(JPEGIMAGE *pJPEG)
 {
+    JPEG_cancelableDecodeReset(pJPEG); // a newly opened image invalidates any previous cancel/resume state
     return JPEGParseInfo(pJPEG, 0); // gather info for image
 } /* JPEGInit() */
 //
@@ -5035,6 +5117,34 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     unsigned char cDCTable0, cACTable0, cDCTable1, cACTable1, cDCTable2, cACTable2;
     JPEGDRAW jd;
     int iMaxFill = 16, iScaleShift = 0;
+    int iResumeMCU = -1; // MCU index to resume at (-1 = decode from the start)
+    int iMCULinear = 0; // linear index of the MCU being decoded
+    int iCheckCount = 0; // MCUs decoded since the last cancel-flag poll
+    int bCanceled = 0; // set when the user's cancel flag stops the decode
+
+    // Cancelable decode: when enabled, every decode starts from a known stream
+    // position. If a previous decode was canceled with the resumable option,
+    // fast-forward past the MCUs which were already completed.
+    if (s_pCancelJPEG == pJPEG && s_piCancelFlag != NULL)
+    {
+        int iSaveCropX = pJPEG->iCropX, iSaveCropY = pJPEG->iCropY;
+        int iSaveCropCX = pJPEG->iCropCX, iSaveCropCY = pJPEG->iCropCY;
+        void *pSaveFB = pJPEG->pFramebuffer;
+        iResumeMCU = s_iResumeMCU; // -1 unless a resumable cancel is pending
+        s_iResumeMCU = -1; // consume it
+        s_bCanceled = 0;
+        s_iMCUsDone = 0;
+        // Re-parse the headers to reposition the entropy stream at the start
+        // of the scan data and restore all tables to a known state
+        pJPEG->ucFF = 0; // reset the 0xff stuffing state
+        (*pJPEG->pfnSeek)(&pJPEG->JPEGFile, 0);
+        if (!JPEGParseInfo(pJPEG, 0))
+            return 0; // something went wrong; iError is set by JPEGParseInfo
+        // JPEGParseInfo resets these; restore the user's settings
+        pJPEG->iCropX = iSaveCropX; pJPEG->iCropY = iSaveCropY;
+        pJPEG->iCropCX = iSaveCropCX; pJPEG->iCropCY = iSaveCropCY;
+        pJPEG->pFramebuffer = pSaveFB;
+    }
 
     // Requested the Exif thumbnail
     if (pJPEG->ucMode == 0xc2) { // progressive mode - we only decode the first scan (DC values)
@@ -5158,6 +5268,8 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
             iMCUCount = (pJPEG->iCropCX / mcuCX); // maximum width is the crop width
         }
     }
+    if (s_pCancelJPEG == pJPEG && s_piCancelFlag != NULL)
+        s_iMCUsTotal = cx * cy; // total MCUs to decode (for progress reporting)
     jd.iBpp = 16;
     switch (pJPEG->ucPixelType)
     {
@@ -5182,10 +5294,25 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     else
         jd.pPixels = pJPEG->usPixels;
     jd.iHeight = mcuCY;
-    for (y = 0; y < cy && bContinue && iErr == 0; y++)
+    for (y = 0; y < cy && bContinue && iErr == 0 && !bCanceled; y++)
     {
         bSkipRow = (y*mcuCY < pJPEG->iCropY);
         jd.x = pJPEG->iXOffset;
+        if (iResumeMCU > 0) // resuming: this row may contain already-decoded MCUs
+        {
+            int iFirstX = iResumeMCU - y*cx; // first not-yet-decoded MCU of this row
+            if (iFirstX > 0 && iFirstX < cx) // the resume point falls inside this row
+            {
+                int xs, iDrawn = 0;
+                // count already-decoded MCUs of this row which would have produced output
+                for (xs = 0; xs < iFirstX; xs++)
+                {
+                    if (pJPEG->ucMode == 0x52 || !(bSkipRow || xs*mcuCX < pJPEG->iCropX || xs*mcuCX > pJPEG->iCropX+pJPEG->iCropCX))
+                        iDrawn++;
+                }
+                jd.x += iDrawn * mcuCX; // position the first new output block correctly
+            }
+        }
         xoff = 0; // start of new LCD output group
         if (pJPEG->pFramebuffer) { // user-supplied buffer is full width
             int ty = (y * mcuCY) - pJPEG->iCropY;
@@ -5201,7 +5328,7 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
         } else { // use our internal buffer to do it a block at a time
             iPitch = iMCUCount * mcuCX; // pixels per line of LCD buffer
         }
-        for (x = 0; x < cx && bContinue && iErr == 0; x++)
+        for (x = 0; x < cx && bContinue && iErr == 0 && !bCanceled; x++)
         {
             if (pJPEG->pFramebuffer == NULL) {
                 pJPEG->usPixels = &pAlignedPixels[iDMAOffset]; // make sure output is correct offset for DMA   
@@ -5211,6 +5338,8 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
             if (pJPEG->ucMode != 0x52 && (bSkipRow || x*mcuCX < pJPEG->iCropX || x*mcuCX > pJPEG->iCropX+pJPEG->iCropCX)) {
                 iSkipMask = MCU_SKIP;
             }
+            if (iMCULinear < iResumeMCU) // already decoded in a previous (canceled) pass
+                iSkipMask = MCU_SKIP; // fast-forward: decode the entropy data, but produce no output
             pJPEG->ucACTable = cACTable0;
             pJPEG->ucDCTable = cDCTable0;
             // do the first luminance component
@@ -5425,8 +5554,32 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
             // See if we need to feed it more data
             if (pJPEG->iVLCOff >= FILE_HIGHWATER)
                 JPEGGetMoreData(pJPEG); // need more 'filtered' VLC data
+            iMCULinear++; // one more MCU fully decoded
+            if (s_pCancelJPEG == pJPEG && s_piCancelFlag != NULL) // cancelable decode active?
+            {
+                s_iMCUsDone = iMCULinear; // progress made so far
+                if (++iCheckCount >= s_iCheckInterval) // time to poll the cancel flag?
+                {
+                    iCheckCount = 0;
+                    if (*s_piCancelFlag) // the user asked to cancel
+                        bCanceled = 1;
+                }
+            }
         } // for x
     } // for y
+    if (bCanceled) // decode was canceled by the user
+    {
+        s_bCanceled = 1;
+        s_iMCUsDone = iMCULinear;
+        if (s_bResumable) // keep a checkpoint so the next decode can continue here
+            s_iResumeMCU = iMCULinear;
+        return 0; // not an error; iError stays JPEG_SUCCESS
+    }
+    if (s_pCancelJPEG == pJPEG) // ran to completion with cancelable decode active
+    {
+        s_iMCUsDone = iMCULinear;
+        s_iResumeMCU = -1; // nothing to resume
+    }
     if (iErr != 0)
         pJPEG->iError = JPEG_DECODE_ERROR;
     return (iErr == 0);
