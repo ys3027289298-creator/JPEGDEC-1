@@ -81,6 +81,34 @@ static int32_t seekFile(JPEGFILE *pFile, int32_t iPosition);
 static void closeFile(void *handle);
 #endif
 static void JPEGDither(JPEGIMAGE *pJPEG, int iWidth, int iHeight);
+
+//
+// Planar YCbCr component output
+// An optional output path which stores the decoded Y, Cb and Cr samples in
+// three separate planes instead of converting them into packed RGB pixels.
+//
+// Output plane sampling formats (horizontal:vertical chroma factor)
+#define JPEG_PLANAR_444 0x44 // 4:4:4 - Cb/Cr planes are full resolution
+#define JPEG_PLANAR_422 0x42 // 4:2:2 - Cb/Cr are 1/2 width, full height
+#define JPEG_PLANAR_420 0x40 // 4:2:0 - Cb/Cr are 1/2 width, 1/2 height
+
+typedef struct jpeg_planar_tag
+{
+    uint8_t ucFormat;       // requested output sampling: JPEG_PLANAR_444/422/420
+    uint8_t ucScaleShift;   // downscale factor exponent: 0=1x, 1=1/2, 2=1/4, 3=1/8
+    uint8_t bLumaOnly;      // non-zero: skip the chroma components entirely
+    uint8_t *pY;            // destination Y plane
+    uint8_t *pCb;           // destination Cb plane (may be NULL for luma-only)
+    uint8_t *pCr;           // destination Cr plane (may be NULL for luma-only)
+    int iOutWidth;          // output luma width in pixels
+    int iOutHeight;         // output luma height in pixels
+    int iChromaWidth;       // output chroma plane width in samples
+    int iChromaHeight;      // output chroma plane height in samples
+} JPEGPLANAR;
+
+// Active planar output for the current decode (NULL = normal RGB path)
+static JPEGPLANAR *pPlanarOutput = NULL;
+static void JPEGWritePlanarMCU(JPEGIMAGE *pJPEG, int xoff, int yoff, int mcuCX, int mcuCY);
 /* JPEG tables */
 const int iBitMasks[33] = {0,1,3,7,0xf,0x1f,0x3f,0x7f,0xff,0x1ff,0x3ff,0x7ff,0x0fff,0x1fff,0x3fff,0x7fff,0xffff,0x1ffff,0x3ffff,0x7ffff,0xfffff,0x1fffff,0x3fffff,0x7fffff,0xffffff,0x1ffffff,0x3ffffff,0x7ffffff,0xfffffff,0x1fffffff,0x3fffffff,0x7fffffff,1};
 // zigzag ordering of DCT coefficients
@@ -5350,7 +5378,9 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                 }
             } // if color components present
             if (!iSkipMask) { // this MCU is not skipped
-                if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
+                if (pPlanarOutput != NULL) {
+                    JPEGWritePlanarMCU(pJPEG, xoff, y * mcuCY, mcuCX, mcuCY);
+                } else if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
                     JPEGPutMCU8BitGray(pJPEG, xoff, iPitch); // grayscale or color is being drawn as grayscale
                 } else {
                     switch (pJPEG->ucSubSample) {
@@ -5431,3 +5461,358 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
         pJPEG->iError = JPEG_DECODE_ERROR;
     return (iErr == 0);
 } /* DecodeJPEG() */
+
+//
+// Store one decoded MCU's samples into the three separate Y/Cb/Cr planes.
+// Source samples come straight out of the IDCT in pJPEG->sMCUs, where every
+// 8x8 block occupies 64 bytes. The block bases mirror the iLum*/iCr/iCb
+// layout used by the MCU decode loop for each source subsampling. Output
+// sampling and the downscale exponent come from the active JPEGPLANAR.
+//
+static void JPEGWritePlanarMCU(JPEGIMAGE *pJPEG, int xoff, int yoff, int mcuCX, int mcuCY)
+{
+    JPEGPLANAR *pP = pPlanarOutput;
+    int iSrcSub = (int)pJPEG->ucSubSample;
+    int iShift = (int)pP->ucScaleShift;
+    int iScale = 1 << iShift;
+    int iHF, iVF;        // requested output chroma horizontal/vertical factor
+    int iSHF, iSVF;      // source JPEG luma horizontal/vertical sampling factor
+    int iYBlocksX, iYBlocksY;
+    int iCBlocksX, iCBlocksY;
+    int iYBase = 0, iCbBase, iCrBase;
+    int y, x;
+
+    //
+    // Every decoded 8x8 block lives in 64 int16_t slots = 128 bytes; the
+    // IDCT packs its 64 output bytes into the first half of that slot.
+    // Block bases therefore use a 128-byte stride, matching the byte
+    // offsets used by the existing JPEGPutMCU* functions.
+    //
+    const int iBlockStride = 2 * DCTSIZE;
+
+    switch (pP->ucFormat)
+    {
+        case JPEG_PLANAR_444:
+            iHF = 1; iVF = 1;
+            break;
+        case JPEG_PLANAR_422:
+            iHF = 2; iVF = 1;
+            break;
+        default: // JPEG_PLANAR_420
+            iHF = 2; iVF = 2;
+            break;
+    }
+    switch (iSrcSub)
+    {
+        case 0x11:
+            iSHF = 1; iSVF = 1;
+            break;
+        case 0x21:
+            iSHF = 2; iSVF = 1;
+            break;
+        case 0x12:
+            iSHF = 1; iSVF = 2;
+            break;
+        default: // 0x22, plus grayscale (0x00)/fake sRGB (0x01)
+            iSHF = 2; iSVF = 2;
+            break;
+    }
+    iYBlocksX = iSHF;
+    iYBlocksY = iSVF;
+    iCBlocksX = iSHF / iHF;
+    iCBlocksY = iSVF / iVF;
+    switch (iSrcSub)
+    {
+        case 0x11:
+            // MCU1 = component 1 (Cb), MCU2 = component 2 (Cr)
+            iCbBase = MCU1 * 2; iCrBase = MCU2 * 2;
+            break;
+        case 0x21:
+        case 0x12:
+            // decoder's internal iCr/iCb names are swapped vs SOF order:
+            // MCU2 holds Cb (component 1), MCU3 holds Cr (component 2)
+            iCbBase = MCU2 * 2; iCrBase = MCU3 * 2;
+            break;
+        default: // 0x22 (grayscale returns before touching chroma)
+            // MCU4 holds Cb (component 1), MCU5 holds Cr (component 2)
+            iCbBase = MCU4 * 2; iCrBase = MCU5 * 2;
+            break;
+    }
+
+    //
+    // Y plane: one sample per output luma pixel. Edge MCUs are padded past
+    // the image boundary, so writes are clipped to iOutWidth/iOutHeight
+    // like the normal RGB output clipping.
+    //
+    for (y = 0; y < mcuCY; y++)
+    {
+        int iy = yoff + y;            // output luma row of this pixel
+        if (iy >= pP->iOutHeight) break;
+        int sy = y * iScale;          // corresponding source luma row
+        int iYBlockRow = sy >> 3;
+        if (iYBlockRow >= iYBlocksY) iYBlockRow = iYBlocksY - 1;
+        for (x = 0; x < mcuCX; x++)
+        {
+            int ix = xoff + x;
+            if (ix >= pP->iOutWidth) break;
+            int sx = x * iScale;
+            int iYBlockCol = sx >> 3;
+            int iSrcOff;
+            if (iYBlockCol >= iYBlocksX) iYBlockCol = iYBlocksX - 1;
+            iSrcOff = iYBase +
+                      (iYBlockRow * iYBlocksX + iYBlockCol) * iBlockStride;
+            iSrcOff += ((sy & 7) << 3) + (sx & 7);
+            pP->pY[iy * pP->iOutWidth + ix] =
+                ((uint8_t *)&pJPEG->sMCUs[0])[iSrcOff];
+        }
+    }
+
+    if (pP->bLumaOnly || pP->pCb == NULL || pP->pCr == NULL ||
+        iSrcSub == 0x00 || iSrcSub == 0x01 || pJPEG->ucNumComponents != 3)
+    {
+        return; // grayscale source or luma-only decode: no chroma to store
+    }
+
+    //
+    // Cb/Cr planes: one sample every iHF output luma columns and every
+    // iVF output luma rows.
+    //
+    for (y = 0; y < mcuCY; y += iVF)
+    {
+        int iy = yoff + y;
+        int iOutY = iy / iVF;
+        if (iOutY >= pP->iChromaHeight) break;
+        int sy = y * iScale;                    // source luma coordinate
+        int scy = sy / iSVF;                    // source chroma coordinate
+        int iCBlockRow = scy >> 3;
+        if (iCBlockRow >= iCBlocksY) iCBlockRow = iCBlocksY - 1;
+        for (x = 0; x < mcuCX; x += iHF)
+        {
+            int ix = xoff + x;
+            int iOutX = ix / iHF;
+            if (iOutX >= pP->iChromaWidth) break;
+            int sx = x * iScale;
+            int scx = sx / iSHF;
+            int iCBlockCol = scx >> 3;
+            int iCbOff, iCrOff;
+            if (iCBlockCol >= iCBlocksX) iCBlockCol = iCBlocksX - 1;
+            iCbOff = iCbBase +
+                     (iCBlockRow * iCBlocksX + iCBlockCol) * iBlockStride;
+            iCrOff = iCrBase +
+                     (iCBlockRow * iCBlocksX + iCBlockCol) * iBlockStride;
+            iCbOff += ((scy & 7) << 3) + (scx & 7);
+            iCrOff += ((scy & 7) << 3) + (scx & 7);
+            {
+                uint8_t *pSrc = (uint8_t *)&pJPEG->sMCUs[0];
+                pP->pCb[iOutY * pP->iChromaWidth + iOutX] = pSrc[iCbOff];
+                pP->pCr[iOutY * pP->iChromaWidth + iOutX] = pSrc[iCrOff];
+            }
+        }
+    }
+} /* JPEGWritePlanarMCU() */
+
+//
+// Decode a JPEG image into three separate Y, Cb and Cr planes.
+// The output chroma sampling (4:4:4 / 4:2:2 / 4:2:0) and the downscale
+// factor (1, 1/2, 1/4, 1/8) are configured in the JPEGPLANAR struct.
+// Caller-supplied planes must be large enough; produced dimensions are
+// reported back in iOutWidth/iOutHeight and iChromaWidth/iChromaHeight.
+// Returns 1 on success, 0 on error (see JPEG_getLastError()).
+//
+int JPEG_decodePlanar(JPEGIMAGE *pJPEG, JPEGPLANAR *pPlanar, int iOptions)
+{
+    int iShift, iScale, iHF, iVF, iSHF, iSVF;
+    uint8_t ucSavedPixelType;
+
+    if (pJPEG == NULL || pPlanar == NULL)
+    {
+        if (pJPEG) pJPEG->iError = JPEG_INVALID_PARAMETER;
+        return 0;
+    }
+    if (pPlanar->ucFormat != JPEG_PLANAR_444 &&
+        pPlanar->ucFormat != JPEG_PLANAR_422 &&
+        pPlanar->ucFormat != JPEG_PLANAR_420)
+    {
+        pJPEG->iError = JPEG_INVALID_PARAMETER; // illegal component format
+        return 0;
+    }
+    if (pPlanar->ucScaleShift > 3)
+    {
+        pJPEG->iError = JPEG_INVALID_PARAMETER; // only 1x, 1/2, 1/4, 1/8
+        return 0;
+    }
+    if (pPlanar->pY == NULL ||
+        (!pPlanar->bLumaOnly && (pPlanar->pCb == NULL || pPlanar->pCr == NULL)))
+    {
+        pJPEG->iError = JPEG_INVALID_PARAMETER;
+        return 0;
+    }
+    if (pJPEG->ucMode == 0xc2)
+    {
+        pJPEG->iError = JPEG_UNSUPPORTED_FEATURE; // planar path is baseline only
+        return 0;
+    }
+    if (iOptions & (JPEG_SCALE_HALF | JPEG_SCALE_QUARTER | JPEG_SCALE_EIGHTH |
+                    JPEG_EXIF_THUMBNAIL))
+    {
+        pJPEG->iError = JPEG_INVALID_PARAMETER; // scaling is set via ucScaleShift
+        return 0;
+    }
+    if (pJPEG->iCropCX != pJPEG->iWidth || pJPEG->iCropCY != pJPEG->iHeight ||
+        pJPEG->iCropX != 0 || pJPEG->iCropY != 0)
+    {
+        pJPEG->iError = JPEG_INVALID_PARAMETER; // planar output needs the full frame
+        return 0;
+    }
+
+    iShift = (int)pPlanar->ucScaleShift;
+    iScale = 1 << iShift;
+    pPlanar->iOutWidth = (pJPEG->iWidth + iScale - 1) / iScale;
+    pPlanar->iOutHeight = (pJPEG->iHeight + iScale - 1) / iScale;
+
+    switch (pPlanar->ucFormat)
+    {
+        case JPEG_PLANAR_444:
+            iHF = 1; iVF = 1;
+            break;
+        case JPEG_PLANAR_422:
+            iHF = 2; iVF = 1;
+            break;
+        default: // JPEG_PLANAR_420
+            iHF = 2; iVF = 2;
+            break;
+    }
+    pPlanar->iChromaWidth = (pPlanar->iOutWidth + iHF - 1) / iHF;
+    pPlanar->iChromaHeight = (pPlanar->iOutHeight + iVF - 1) / iVF;
+
+    // a requested output sampling cannot be finer than what the JPEG stores
+    switch (pJPEG->ucSubSample)
+    {
+        case 0x11:
+            iSHF = 1; iSVF = 1;
+            break;
+        case 0x21:
+            iSHF = 2; iSVF = 1;
+            break;
+        case 0x12:
+            iSHF = 1; iSVF = 2;
+            break;
+        default: // 0x22, plus grayscale handled below
+            iSHF = 2; iSVF = 2;
+            break;
+    }
+    if (pJPEG->ucNumComponents == 3 && (iHF < iSHF || iVF < iSVF))
+    {
+        pJPEG->iError = JPEG_INVALID_PARAMETER;
+        return 0;
+    }
+
+    // Grayscale JPEG: fill neutral chroma (128) so RGB reconstruction works
+    if (pJPEG->ucNumComponents == 1 && !pPlanar->bLumaOnly &&
+        pPlanar->pCb != NULL && pPlanar->pCr != NULL)
+    {
+        memset(pPlanar->pCb, 0x80,
+               (size_t)pPlanar->iChromaWidth * pPlanar->iChromaHeight);
+        memset(pPlanar->pCr, 0x80,
+               (size_t)pPlanar->iChromaWidth * pPlanar->iChromaHeight);
+    }
+
+    ucSavedPixelType = pJPEG->ucPixelType;
+    if (pPlanar->bLumaOnly)
+        iOptions |= JPEG_LUMA_ONLY; // reuse the decoder's chroma-skip fast path
+    else
+        pJPEG->ucPixelType = RGB565_LITTLE_ENDIAN; // force full chroma IDCT
+    pPlanarOutput = pPlanar;
+    {
+        int iRC = JPEG_decode(pJPEG, 0, 0, iOptions);
+        pPlanarOutput = NULL;
+        pJPEG->ucPixelType = ucSavedPixelType;
+        return iRC;
+    }
+} /* JPEG_decodePlanar() */
+
+//
+// Reconstruct a packed RGB image from three planar Y/Cb/Cr buffers.
+// iPixelType selects RGB565_LITTLE_ENDIAN, RGB565_BIG_ENDIAN or RGB8888.
+// Chroma sampling and the downscale exponent must match the values the
+// planes were produced with. Conversion arithmetic is identical to the
+// decoder's normal RGB path. Returns 1 on success, 0 on bad parameters.
+//
+int JPEG_planarToRGB(JPEGPLANAR *pPlanar, int iPixelType, void *pRGB)
+{
+    int y, x;
+    uint16_t *p16;
+    uint8_t *p8;
+    int iHF, iVF;
+
+    if (pPlanar == NULL || pRGB == NULL || pPlanar->pY == NULL)
+        return 0;
+    if (pPlanar->ucFormat != JPEG_PLANAR_444 &&
+        pPlanar->ucFormat != JPEG_PLANAR_422 &&
+        pPlanar->ucFormat != JPEG_PLANAR_420)
+        return 0; // illegal component format
+    if (pPlanar->ucScaleShift > 3)
+        return 0;
+    if (iPixelType != RGB565_LITTLE_ENDIAN &&
+        iPixelType != RGB565_BIG_ENDIAN &&
+        iPixelType != RGB8888)
+        return 0;
+    if (pPlanar->iOutWidth <= 0 || pPlanar->iOutHeight <= 0 ||
+        pPlanar->iChromaWidth <= 0 || pPlanar->iChromaHeight <= 0)
+        return 0;
+    if (!pPlanar->bLumaOnly && (pPlanar->pCb == NULL || pPlanar->pCr == NULL))
+        return 0;
+
+    switch (pPlanar->ucFormat)
+    {
+        case JPEG_PLANAR_444:
+            iHF = 1; iVF = 1;
+            break;
+        case JPEG_PLANAR_422:
+            iHF = 2; iVF = 1;
+            break;
+        default: // JPEG_PLANAR_420
+            iHF = 2; iVF = 2;
+            break;
+    }
+
+    p16 = (uint16_t *)pRGB;
+    p8 = (uint8_t *)pRGB;
+    for (y = 0; y < pPlanar->iOutHeight; y++)
+    {
+        int iCY = y / iVF;
+        if (iCY >= pPlanar->iChromaHeight) iCY = pPlanar->iChromaHeight - 1;
+        for (x = 0; x < pPlanar->iOutWidth; x++)
+        {
+            int iCX = x / iHF;
+            int iY, iCb, iCr;
+            if (iCX >= pPlanar->iChromaWidth) iCX = pPlanar->iChromaWidth - 1;
+            iY = (int)pPlanar->pY[y * pPlanar->iOutWidth + x] << 12;
+            if (pPlanar->bLumaOnly || pPlanar->pCb == NULL || pPlanar->pCr == NULL)
+            {
+                iCb = iCr = 0x80;
+            }
+            else
+            {
+                iCb = pPlanar->pCb[iCY * pPlanar->iChromaWidth + iCX];
+                iCr = pPlanar->pCr[iCY * pPlanar->iChromaWidth + iCX];
+            }
+            if (iPixelType == RGB565_LITTLE_ENDIAN)
+            {
+                JPEGPixelLE(p16, iY, iCb, iCr);
+                p16++;
+            }
+            else if (iPixelType == RGB565_BIG_ENDIAN)
+            {
+                JPEGPixelBE(p16, iY, iCb, iCr);
+                p16++;
+            }
+            else // RGB8888
+            {
+                JPEGPixelRGB((uint32_t *)p8, iY, iCb, iCr);
+                p8 += 4;
+            }
+        }
+    }
+    return 1;
+} /* JPEG_planarToRGB() */
