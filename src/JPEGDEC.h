@@ -157,6 +157,43 @@ typedef int (JPEG_DRAW_CALLBACK)(JPEGDRAW *pDraw);
 typedef void * (JPEG_OPEN_CALLBACK)(const char *szFilename, int32_t *pFileSize);
 typedef void (JPEG_CLOSE_CALLBACK)(void *pHandle);
 
+//
+// Strip (banded) decoding
+//
+// decodeStrips() delivers the decoded image one horizontal strip of N rows
+// at a time through this structure. The caller can consume each strip
+// immediately (e.g. write it to a file) while the decoder holds only a
+// single strip buffer internally, so a large image can be landed on a
+// device whose RAM is much smaller than the full bitmap.
+//
+typedef struct jpeg_strip_tag
+{
+    int y;            // first row of this strip in the output image
+    int iHeight;      // number of valid rows in this strip (the last strip may be shorter)
+    int iWidth;       // width of the output image in pixels
+    int iBpp;         // bits per pixel of the data in pPixels
+    int iPitch;       // bytes per row in pPixels
+    uint8_t *pPixels; // strip pixels: iHeight rows of iPitch bytes each
+    void *pUser;      // user pointer passed to decodeStrips()
+} JPEGSTRIP;
+
+typedef int (JPEG_STRIP_CALLBACK)(JPEGSTRIP *pStrip);
+
+// internal state used by JPEGDEC::decodeStrips()
+typedef struct jpeg_strip_ctx_tag
+{
+    uint8_t *pStrip;          // the single strip buffer
+    int iStripHeight;         // rows delivered per strip callback
+    int iBufRows;             // rows the strip buffer can hold (iStripHeight + MCU band slack)
+    int iStripY;              // output y of the first row held in the strip buffer
+    int iRows;                // rows currently accumulated in the strip buffer
+    int iOutWidth, iOutHeight;// output image size (after any scaling)
+    int iBytesPerPixel;
+    int iAborted;             // set when the user's strip callback asks to stop
+    JPEG_STRIP_CALLBACK *pfnStrip;
+    void *pUser;
+} JPEGSTRIPCTX;
+
 /* JPEG color component info */
 typedef struct _jpegcompinfo
 {
@@ -281,10 +318,163 @@ class JPEGDEC
     void setPixelType(int iType); // defaults to little endian
     int getPixelType();
     void setMaxOutputSize(int iMaxMCUs);
+    // Decode the current image and deliver the output one horizontal strip
+    // of iStripHeight rows at a time to pfnStrip. Only a single strip
+    // buffer (iStripHeight * width * bytes-per-pixel) is allocated, so large
+    // images can be decoded on devices which cannot hold the full bitmap.
+    // iStripHeight must be >= 1; values taller than the image are clamped
+    // to a single strip. Returns 1 on success, 0 on failure (see
+    // getLastError()) or if the strip callback asked to stop (returns 0).
+    int decodeStrips(int iStripHeight, JPEG_STRIP_CALLBACK *pfnStrip, void *pUser = NULL, int iOptions = 0);
 
   private:
+    static int JPEGStripDraw(JPEGDRAW *pDraw);
+    static int JPEGStripFlush(JPEGSTRIPCTX *pCtx, int iRowsToSend);
     JPEGIMAGE _jpeg;
 };
+//
+// JPEGStripFlush - hand the first iRowsToSend rows of the strip buffer to
+// the caller; any leftover rows (a partial MCU band belonging to the next
+// strip) are kept and moved to the start of the buffer.
+//
+inline int JPEGDEC::JPEGStripFlush(JPEGSTRIPCTX *pCtx, int iRowsToSend)
+{
+    JPEGSTRIP js;
+    int rc, iPitch = pCtx->iOutWidth * pCtx->iBytesPerPixel;
+
+    js.y = pCtx->iStripY;
+    js.iHeight = iRowsToSend;
+    js.iWidth = pCtx->iOutWidth;
+    js.iBpp = pCtx->iBytesPerPixel * 8;
+    js.iPitch = iPitch;
+    js.pPixels = pCtx->pStrip;
+    js.pUser = pCtx->pUser;
+    rc = (*pCtx->pfnStrip)(&js);
+    pCtx->iStripY += iRowsToSend;
+    pCtx->iRows -= iRowsToSend;
+    if (pCtx->iRows > 0) // keep the partial band for the next strip
+        memmove(pCtx->pStrip, pCtx->pStrip + (size_t)iRowsToSend * iPitch,
+                (size_t)pCtx->iRows * iPitch);
+    if (!rc)
+        pCtx->iAborted = 1;
+    return rc;
+} /* JPEGStripFlush() */
+//
+// JPEGStripDraw - JPEG_DRAW_CALLBACK thunk used by decodeStrips(). The core
+// decoder delivers MCU row groups in raster order; this copies them into
+// the single strip buffer and flushes it to the caller every time
+// iStripHeight rows have been completed.
+//
+inline int JPEGDEC::JPEGStripDraw(JPEGDRAW *pDraw)
+{
+    JPEGSTRIPCTX *pCtx = (JPEGSTRIPCTX *)pDraw->pUser;
+    int r, iRow, iW, iFilled;
+    int iSrcPitch = pDraw->iWidth * pCtx->iBytesPerPixel;
+
+    iW = pDraw->iWidthUsed; // valid pixels on this row (right edge is clipped)
+    if (pDraw->x + iW > pCtx->iOutWidth)
+        iW = pCtx->iOutWidth - pDraw->x;
+    if (iW > 0) {
+        for (r = 0; r < pDraw->iHeight; r++) {
+            iRow = pDraw->y + r - pCtx->iStripY;
+            if (iRow >= 0 && iRow < pCtx->iBufRows) {
+                memcpy(&pCtx->pStrip[(iRow * pCtx->iOutWidth + pDraw->x) * pCtx->iBytesPerPixel],
+                       (uint8_t *)pDraw->pPixels + r * iSrcPitch,
+                       iW * pCtx->iBytesPerPixel);
+            }
+        }
+    }
+    // A strip can only be flushed when a full-width MCU row band has been
+    // completed; the decoder delivers a wide band as several JPEGDRAW calls,
+    // so wait for the group which reaches the right edge of the image.
+    if (pDraw->x + iW >= pCtx->iOutWidth) {
+        iFilled = pDraw->y + pDraw->iHeight - pCtx->iStripY;
+        if (iFilled > pCtx->iRows)
+            pCtx->iRows = iFilled;
+    }
+    while (pCtx->iRows >= pCtx->iStripHeight) { // a full strip is ready
+        if (!JPEGStripFlush(pCtx, pCtx->iStripHeight))
+            return 0; // the caller asked to stop
+    }
+    return 1; // continue decoding
+} /* JPEGStripDraw() */
+//
+// decodeStrips - decode the current image, delivering the output pixels one
+// horizontal strip of iStripHeight rows at a time. The pixel data is
+// identical to decode(); only the delivery (and the memory footprint)
+// differs. The caller receives ceil(output_height / iStripHeight) callbacks
+// covering every output row exactly once.
+//
+inline int JPEGDEC::decodeStrips(int iStripHeight, JPEG_STRIP_CALLBACK *pfnStrip, void *pUser, int iOptions)
+{
+    JPEGSTRIPCTX ctx;
+    JPEG_DRAW_CALLBACK *pfnOldDraw;
+    void *pOldUser;
+    int i, iScaleShift = 0, iAdjust, iMCURows;
+    int iOldCropX, iOldCropY, iOldCropCX, iOldCropCY;
+
+    if (pfnStrip == NULL || iStripHeight < 1 || _jpeg.iWidth < 1 || _jpeg.iHeight < 1) {
+        _jpeg.iError = JPEG_INVALID_PARAMETER;
+        return 0;
+    }
+    if (_jpeg.ucPixelType > EIGHT_BIT_GRAYSCALE) { // 4/2/1-bit dithered output is bit-packed; not supported
+        _jpeg.iError = JPEG_UNSUPPORTED_FEATURE;
+        return 0;
+    }
+    if (iOptions & JPEG_SCALE_HALF)
+        iScaleShift = 1;
+    else if (iOptions & JPEG_SCALE_QUARTER)
+        iScaleShift = 2;
+    else if (iOptions & JPEG_SCALE_EIGHTH)
+        iScaleShift = 3;
+    iAdjust = (1 << iScaleShift) - 1;
+    ctx.iOutWidth = (_jpeg.iWidth + iAdjust) >> iScaleShift;
+    ctx.iOutHeight = (_jpeg.iHeight + iAdjust) >> iScaleShift;
+    ctx.iBytesPerPixel = (_jpeg.ucPixelType == RGB8888) ? 4 :
+                         (_jpeg.ucPixelType == EIGHT_BIT_GRAYSCALE) ? 1 : 2;
+    if (iStripHeight > ctx.iOutHeight) // taller than the image: a single strip
+        iStripHeight = ctx.iOutHeight;
+    ctx.iStripHeight = iStripHeight;
+    // The decoder delivers whole MCU row bands, so the buffer needs slack
+    // for one band beyond the strip height (never more than the image).
+    iMCURows = ((_jpeg.ucSubSample == 0x12 || _jpeg.ucSubSample == 0x22) ? 16 : 8) >> iScaleShift;
+    ctx.iBufRows = iStripHeight + iMCURows - 1;
+    if (ctx.iBufRows > ctx.iOutHeight)
+        ctx.iBufRows = ctx.iOutHeight;
+    ctx.iStripY = 0;
+    ctx.iRows = 0;
+    ctx.iAborted = 0;
+    ctx.pfnStrip = pfnStrip;
+    ctx.pUser = pUser;
+    ctx.pStrip = (uint8_t *)malloc((size_t)ctx.iBufRows * (size_t)ctx.iOutWidth * (size_t)ctx.iBytesPerPixel);
+    if (ctx.pStrip == NULL) {
+        _jpeg.iError = JPEG_ERROR_MEMORY;
+        return 0;
+    }
+    // Save the decoder state we temporarily replace. Strip decoding always
+    // walks the whole image in raster order, so any crop area is suspended.
+    pfnOldDraw = _jpeg.pfnDraw;
+    pOldUser = _jpeg.pUser;
+    iOldCropX = _jpeg.iCropX; iOldCropY = _jpeg.iCropY;
+    iOldCropCX = _jpeg.iCropCX; iOldCropCY = _jpeg.iCropCY;
+    _jpeg.iCropX = _jpeg.iCropY = 0;
+    _jpeg.iCropCX = _jpeg.iWidth;
+    _jpeg.iCropCY = _jpeg.iHeight;
+    _jpeg.pfnDraw = JPEGStripDraw;
+    _jpeg.pUser = &ctx;
+    i = decode(0, 0, iOptions);
+    // restore the saved state
+    _jpeg.pfnDraw = pfnOldDraw;
+    _jpeg.pUser = pOldUser;
+    _jpeg.iCropX = iOldCropX; _jpeg.iCropY = iOldCropY;
+    _jpeg.iCropCX = iOldCropCX; _jpeg.iCropCY = iOldCropCY;
+    if (i && !ctx.iAborted && ctx.iRows > 0) // deliver the final partial strip
+        JPEGStripFlush(&ctx, ctx.iRows);
+    free(ctx.pStrip);
+    if (ctx.iAborted)
+        return 0; // the strip callback asked to stop
+    return i;
+} /* decodeStrips() */
 #else
 #define JPEG_STATIC
 int JPEG_openRAM(JPEGIMAGE *pJPEG, uint8_t *pData, int iDataSize, JPEG_DRAW_CALLBACK *pfnDraw);
