@@ -3307,6 +3307,200 @@ static void JPEGPixel2RGB(uint32_t *pDest, int32_t iY1, int32_t iY2, int32_t iCb
     pDest[1] = u32Pixel2;
 } /* JPEGPixel2RGB() */
 
+//
+// Chroma upsampling filter modes (selected by bits 8-9 of the decode options)
+// JPEG_UPSAMPLE_NEAREST (0) is the default and reproduces the original
+// pixel-for-pixel output. The filtered modes only apply to full-size
+// color decodes; scaled and grayscale output always uses nearest.
+//
+#define JPEG_UPSAMPLE_NEAREST  0x000 // replicate each chroma sample to a 2x2 pixel block
+#define JPEG_UPSAMPLE_BILINEAR 0x100 // separable triangle (3:1) filter
+#define JPEG_UPSAMPLE_ADAPTIVE 0x200 // edge-directed: filter along luma edges, not across
+#define JPEG_UPSAMPLE_MASK     0x300 // both bits set = reserved/invalid mode
+
+//
+// Upsample an 8x8 chroma plane to the full MCU resolution.
+// pSrc: 8x8 subsampled chroma (row-major)
+// pDst: (bH?16:8) x (bV?16:8) output plane (row-major)
+// pY:   full-resolution luma plane with the same dimensions as pDst
+// bAdaptive: 0 = bilinear (triangle filter), 1 = edge-directed using luma
+//
+static void JPEGUpsampleChroma(const uint8_t *pSrc, uint8_t *pDst, int bH, int bV, const uint8_t *pY, int bAdaptive)
+{
+    uint8_t ucHF[8*16]; // horizontally filtered rows (8 rows)
+    uint8_t ucVF[16*8]; // vertically filtered columns (8 cols)
+    int iW = bH ? 16 : 8;
+    int iH = bV ? 16 : 8;
+    int x, y, k, c0;
+
+    // horizontal pass (triangle filter with co-sited centers)
+    for (y = 0; y < 8; y++) {
+        const uint8_t *s = &pSrc[y*8];
+        uint8_t *d = &ucHF[y*16];
+        if (bH) {
+            for (k = 0; k < 8; k++) {
+                c0 = s[k];
+                d[k*2]   = (uint8_t)((3*c0 + s[(k > 0) ? k-1 : 0] + 2) >> 2);
+                d[k*2+1] = (uint8_t)((3*c0 + s[(k < 7) ? k+1 : 7] + 2) >> 2);
+            }
+        } else {
+            for (k = 0; k < 8; k++)
+                d[k] = s[k];
+        }
+    }
+    // vertical pass
+    if (bV) {
+        for (k = 0; k < 8; k++) {
+            const uint8_t *s = &pSrc[k*8];
+            const uint8_t *s0 = &pSrc[((k > 0) ? k-1 : 0)*8];
+            const uint8_t *s1 = &pSrc[((k < 7) ? k+1 : 7)*8];
+            uint8_t *d = &ucVF[k*2*8];
+            for (x = 0; x < 8; x++) {
+                c0 = s[x];
+                d[x]   = (uint8_t)((3*c0 + s0[x] + 2) >> 2);
+                d[8+x] = (uint8_t)((3*c0 + s1[x] + 2) >> 2);
+            }
+        }
+    }
+    // combine
+    for (y = 0; y < iH; y++) {
+        int ky = bV ? (y >> 1) : y;
+        int ky0 = (ky > 0) ? ky-1 : 0;
+        int ky1 = (ky < 7) ? ky+1 : 7;
+        for (x = 0; x < iW; x++) {
+            int kx = bH ? (x >> 1) : x;
+            int bSmoothH = bH, bSmoothV = bV;
+            if (bAdaptive) { // measure the luma edge direction at this pixel
+                int xm = (x > 0) ? x-1 : 0;
+                int xp = (x < iW-1) ? x+1 : iW-1;
+                int ym = (y > 0) ? y-1 : 0;
+                int yp = (y < iH-1) ? y+1 : iH-1;
+                int gx = abs((int)pY[y*iW+xp] - (int)pY[y*iW+xm]);
+                int gy = abs((int)pY[yp*iW+x] - (int)pY[ym*iW+x]);
+                if (gx > 2*gy) // strong vertical edge: don't blend across it
+                    bSmoothH = 0;
+                else if (gy > 2*gx) // strong horizontal edge
+                    bSmoothV = 0;
+            }
+            if (bSmoothH && bSmoothV) { // full bilinear: vertical filter of HF column
+                c0 = ucHF[ky*16+x];
+                if (y & 1)
+                    pDst[y*iW+x] = (uint8_t)((3*c0 + ucHF[ky1*16+x] + 2) >> 2);
+                else
+                    pDst[y*iW+x] = (uint8_t)((3*c0 + ucHF[ky0*16+x] + 2) >> 2);
+            } else if (bSmoothH) {
+                pDst[y*iW+x] = ucHF[ky*16+x];
+            } else if (bSmoothV) {
+                pDst[y*iW+x] = ucVF[y*8+kx];
+            } else { // nearest
+                pDst[y*iW+x] = pSrc[ky*8+kx];
+            }
+        }
+    }
+} /* JPEGUpsampleChroma() */
+
+//
+// Full-size color MCU output with filtered (bilinear/adaptive) chroma
+// upsampling. Handles the 0x22, 0x21 and 0x12 subsampling layouts and
+// reproduces the same set of clipped output pixels as the nearest paths.
+//
+static void JPEGPutMCUFiltered(JPEGIMAGE *pJPEG, int x, int iPitch)
+{
+    uint8_t ucY[256], ucCb[256], ucCr[256];
+    const uint8_t *pY, *pCb, *pCr;
+    int iW, iH, i, j, bAdaptive;
+    int iCol, iRow, iXCount1, iXCount2, iMaxCol;
+    int bUseOdd1, bUseOdd2;
+    int iY, iCb, iCr;
+    uint16_t *pOutput = &pJPEG->usPixels[x];
+
+    if (pJPEG->ucPixelType == RGB8888)
+        pOutput += x; // 4 bytes per pixel, not 2
+
+    pY = (const uint8_t *)&pJPEG->sMCUs[0];
+    bAdaptive = (pJPEG->iOptions & JPEG_UPSAMPLE_MASK) == JPEG_UPSAMPLE_ADAPTIVE;
+    // gather the luma blocks into a contiguous full-resolution plane
+    switch (pJPEG->ucSubSample) {
+        case 0x22:
+            pCb = (const uint8_t *)&pJPEG->sMCUs[4*DCTSIZE];
+            pCr = (const uint8_t *)&pJPEG->sMCUs[5*DCTSIZE];
+            iW = iH = 16;
+            for (j = 0; j < 16; j++)
+                for (i = 0; i < 16; i++)
+                    ucY[j*16+i] = pY[((j>>3)*2 + (i>>3))*128 + (j&7)*8 + (i&7)];
+            break;
+        case 0x21:
+            pCb = (const uint8_t *)&pJPEG->sMCUs[2*DCTSIZE];
+            pCr = (const uint8_t *)&pJPEG->sMCUs[3*DCTSIZE];
+            iW = 16; iH = 8;
+            for (j = 0; j < 8; j++)
+                for (i = 0; i < 16; i++)
+                    ucY[j*16+i] = pY[(i>>3)*128 + j*8 + (i&7)];
+            break;
+        default: // 0x12
+            pCb = (const uint8_t *)&pJPEG->sMCUs[2*DCTSIZE];
+            pCr = (const uint8_t *)&pJPEG->sMCUs[3*DCTSIZE];
+            iW = 8; iH = 16;
+            for (j = 0; j < 16; j++)
+                for (i = 0; i < 8; i++)
+                    ucY[j*8+i] = pY[(j>>3)*128 + (j&7)*8 + i];
+            break;
+    }
+    JPEGUpsampleChroma(pCb, ucCb, iW == 16, iH == 16, ucY, bAdaptive);
+    JPEGUpsampleChroma(pCr, ucCr, iW == 16, iH == 16, ucY, bAdaptive);
+
+    // determine the set of columns to draw (mirrors the nearest paths)
+    iXCount1 = iXCount2 = 0; iMaxCol = iW;
+    bUseOdd1 = bUseOdd2 = 1;
+    if (pJPEG->ucSubSample == 0x22) {
+        if ((x+15) >= iPitch) {
+            iCol = (((iPitch & 15)+1) >> 1);
+            if (iCol >= 4) {
+                iXCount1 = 4;
+                iXCount2 = iCol-4;
+                if (iPitch & 1 && (iXCount2 * 2) + 8 + (x * 16) > iPitch)
+                    bUseOdd2 = 0;
+            } else {
+                iXCount1 = iCol;
+                iXCount2 = 0;
+                if (iPitch & 1 && (iXCount1 * 2) + (x * 16) > iPitch)
+                    bUseOdd1 = 0;
+            }
+        } else {
+            iXCount1 = iXCount2 = 4;
+        }
+    } else if (pJPEG->ucSubSample == 0x21) {
+        if (x + 16 > pJPEG->iWidth)
+            iMaxCol = pJPEG->iWidth - x; // horizontal cropping
+    }
+    for (iRow = 0; iRow < iH; iRow++) {
+        for (iCol = 0; iCol < iW; iCol++) {
+            if (pJPEG->ucSubSample == 0x22) { // skip columns clipped on the right edge
+                if (iCol < 8) {
+                    if (iCol >= iXCount1*2 || (iCol == iXCount1*2-1 && !bUseOdd1))
+                        continue;
+                } else {
+                    if (iCol-8 >= iXCount2*2 || (iCol == 8+iXCount2*2-1 && !bUseOdd2))
+                        continue;
+                }
+            } else if (pJPEG->ucSubSample == 0x21) {
+                if (iCol >= iMaxCol)
+                    continue;
+            }
+            iY  = ucY[iRow*iW+iCol] << 12; // scale to level of conversion table
+            iCb = ucCb[iRow*iW+iCol];
+            iCr = ucCr[iRow*iW+iCol];
+            if (pJPEG->ucPixelType == RGB565_LITTLE_ENDIAN)
+                JPEGPixelLE(pOutput + iCol, iY, iCb, iCr);
+            else if (pJPEG->ucPixelType == RGB565_BIG_ENDIAN)
+                JPEGPixelBE(pOutput + iCol, iY, iCb, iCr);
+            else // RGB8888
+                JPEGPixelRGB((uint32_t *)&pOutput[iCol*2], iY, iCb, iCr);
+        }
+        pOutput += (pJPEG->ucPixelType == RGB8888) ? iPitch*2 : iPitch;
+    }
+} /* JPEGPutMCUFiltered() */
+
 static void JPEGPutMCU11(JPEGIMAGE *pJPEG, int x, int iPitch)
 {
     int iCr, iCb;
@@ -3771,6 +3965,11 @@ static void JPEGPutMCU22(JPEGIMAGE *pJPEG, int x, int iPitch)
         return;
     }
 // full size
+    if (pJPEG->iOptions & JPEG_UPSAMPLE_MASK) // filtered chroma upsampling requested
+    {
+        JPEGPutMCUFiltered(pJPEG, x, iPitch);
+        return;
+    }
 #ifdef ESP32S3_SIMD
     if (x + 8 <= iPitch && (iPitch & 15) == 0) { // only for non-clipped MCUs
         if (pJPEG->ucPixelType == RGB8888) iPitch *= 2;
@@ -4706,6 +4905,11 @@ static void JPEGPutMCU12(JPEGIMAGE *pJPEG, int x, int iPitch)
         return;
     }
 // full size
+    if (pJPEG->iOptions & JPEG_UPSAMPLE_MASK) // filtered chroma upsampling requested
+    {
+        JPEGPutMCUFiltered(pJPEG, x, iPitch);
+        return;
+    }
     /* Convert YCC pixels into RGB pixels and store in output image */
     iYCount = 16;
     iXCount = 8;
@@ -4858,6 +5062,11 @@ static void JPEGPutMCU21(JPEGIMAGE *pJPEG, int x, int iPitch)
         return;
     }
 // Full size
+    if (pJPEG->iOptions & JPEG_UPSAMPLE_MASK) // filtered chroma upsampling requested
+    {
+        JPEGPutMCUFiltered(pJPEG, x, iPitch);
+        return;
+    }
     /* Convert YCC pixels into RGB pixels and store in output image */
     if (x + 16 > pJPEG->iWidth) { // slower version with horizontal cropping
         int iMaxCol = pJPEG->iWidth - x; // how many columns we can draw
@@ -5036,6 +5245,11 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     JPEGDRAW jd;
     int iMaxFill = 16, iScaleShift = 0;
 
+    if ((pJPEG->iOptions & JPEG_UPSAMPLE_MASK) == JPEG_UPSAMPLE_MASK) // reserved/invalid upsampling mode
+    {
+        pJPEG->iError = JPEG_INVALID_PARAMETER;
+        return 0;
+    }
     // Requested the Exif thumbnail
     if (pJPEG->ucMode == 0xc2) { // progressive mode - we only decode the first scan (DC values)
         pJPEG->iOptions |= JPEG_SCALE_EIGHTH; // return 1/8 sized image
