@@ -1,0 +1,14 @@
+In file included from main.c:11:
+../../../src/jpeg.inl:840:15: warning: ‘openFile’ defined but not used [-Wunused-function]
+  840 | static void * openFile(const char *szFilename, int32_t *pFileSize)
+      |               ^~~~~~~~
+../../../src/jpeg.inl:802:16: warning: ‘readFLASH’ defined but not used [-Wunused-function]
+  802 | static int32_t readFLASH(JPEGFILE *pFile, uint8_t *pBuf, int32_t iLen)
+      |                ^~~~~~~~~
+../../../src/jpeg.inl: In function ‘JPEGFilter’:
+../../../src/jpeg.inl:1483:25: warning: ‘xmmIn’ is used uninitialized [-Wuninitialized]
+ 1483 |         __m128i xmmFF = _mm_cmpeq_epi8(xmmIn, xmmIn);
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+../../../src/jpeg.inl:1482:17: note: ‘xmmIn’ was declared here
+ 1482 |         __m128i xmmIn, xmmOut;
+      |                 ^~~~~

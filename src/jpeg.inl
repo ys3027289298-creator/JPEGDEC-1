@@ -68,8 +68,43 @@ int16_t i16_Consts[8] = {0x80, 113, 90, 22, 46, 1,32,2048};
 #define HAS_NEON
 #endif
 
+//
+// IDCT backend selection (compile-time capability + runtime dispatch)
+// A vectorized IDCT path (SSE2 on x86_64, NEON on arm64) is compiled in
+// when the toolchain/target supports it; otherwise only the generic
+// scalar path exists and every runtime query reports the generic path.
+// The vector path can additionally be disabled at runtime to force the
+// bit-identical generic fallback (see JPEG_forceGenericIDCT()).
+//
+#define JPEG_IDCT_BACKEND_GENERIC 0
+#define JPEG_IDCT_BACKEND_VECTOR  1
+#if defined(HAS_SSE) || defined(HAS_NEON)
+#define JPEG_IDCT_HAS_VECTOR 1
+#else
+#define JPEG_IDCT_HAS_VECTOR 0
+#endif
+// Cache line size used for IDCT coefficient/working-buffer alignment.
+// 64 bytes covers x86_64 (including modern AMD/Intel) and ARM Cortex-A
+// class cores; smaller-line cores simply ignore the extra padding.
+#ifndef JPEG_CACHE_LINE_SIZE
+#define JPEG_CACHE_LINE_SIZE 64
+#endif
+#if defined(__GNUC__)
+#define JPEG_MAYBE_UNUSED __attribute__((unused))
+#else
+#define JPEG_MAYBE_UNUSED
+#endif
+// Runtime IDCT path control/query (implemented below in this file).
+// No existing public class/C signature is changed; these are new,
+// separately named entry points for diagnostics and fallback testing.
+static int JPEG_getIDCTBackend(void);
+static int JPEG_getIDCTBufferAlignment(JPEGIMAGE *pJPEG);
+static void JPEG_MAYBE_UNUSED JPEG_forceGenericIDCT(int bForce);
+static int JPEG_bForceGenericIDCT JPEG_MAYBE_UNUSED = 0;
+
 // forward references
 static int JPEGInit(JPEGIMAGE *pJPEG);
+static void JPEGReleaseAlignedBlock(JPEGIMAGE *pJPEG);
 static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb);
 static void JPEGGetMoreData(JPEGIMAGE *pPage);
 static int DecodeJPEG(JPEGIMAGE *pImage);
@@ -105,44 +140,44 @@ static const unsigned char cZigZag2[64] = {0,1,8,16,9,2,3,10,
 
 #ifdef HAS_NEON
 // 16-bit constants for NEON ycc->rgb conversion
-static const int16_t __attribute__((aligned(16))) sYCCRGBConstants[4] = {5742/2, -2925/2, -1409/2, 7258/2};
-// 16-bit constants for IDCT calculation
-static const int16_t __attribute__((aligned(16))) s0414[8] = {1697*2,1697*2,1697*2,1697*2,1697*2,1697*2,1697*2,1697*2}; // 1.414213562 - 1.0
-static const int16_t __attribute__((aligned(16))) s1414[8] = {5793*2,5793*2,5793*2,5793*2,5793*2,5793*2,5793*2,5793*2}; // 1.414213562
-static const int16_t __attribute__((aligned(16))) s1847[8] = {7568*2,7568*2,7568*2,7568*2,7568*2,7568*2,7568*2,7568*2}; // 1.8477
-static const int16_t __attribute__((aligned(16))) s2613[8] = {-10703,-10703,-10703,-10703,-10703,-10703,-10703,-10703}; // -2.6131259
-static const int16_t __attribute__((aligned(16))) sp2613[8] = {10703,10703,10703,10703,10703,10703,10703,10703}; // 2.6131259
-static const int16_t __attribute__((aligned(16))) s1082[8] = {4433*2,4433*2,4433*2,4433*2,4433*2,4433*2,4433*2,4433*2}; // 1.08239
+static const int16_t __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) sYCCRGBConstants[4] = {5742/2, -2925/2, -1409/2, 7258/2};
+// 16-bit constants for IDCT calculation (cache-line aligned)
+static const int16_t __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) s0414[8] = {1697*2,1697*2,1697*2,1697*2,1697*2,1697*2,1697*2,1697*2}; // 1.414213562 - 1.0
+static const int16_t __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) s1414[8] = {5793*2,5793*2,5793*2,5793*2,5793*2,5793*2,5793*2,5793*2}; // 1.414213562
+static const int16_t __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) s1847[8] = {7568*2,7568*2,7568*2,7568*2,7568*2,7568*2,7568*2,7568*2}; // 1.8477
+static const int16_t __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) s2613[8] = {-10703,-10703,-10703,-10703,-10703,-10703,-10703,-10703}; // -2.6131259
+static const int16_t __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) sp2613[8] = {10703,10703,10703,10703,10703,10703,10703,10703}; // 2.6131259
+static const int16_t __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) s1082[8] = {4433*2,4433*2,4433*2,4433*2,4433*2,4433*2,4433*2,4433*2}; // 1.08239
 #endif // HAS_NEON
 
 #ifdef HAS_SSE
 #if defined ( __GNUC__ ) || defined( _GCC_ANDROID ) || defined( __APPLE__)
-signed short s1402[8] __attribute__((aligned(16))) = { 5742, 5742, 5742, 5742, 5742, 5742, 5742, 5742 };
-signed short s0714[8] __attribute__((aligned(16))) = { -2925, -2925, -2925, -2925, -2925, -2925, -2925, -2925 };
-signed short s0344[8] __attribute__((aligned(16))) = { -1409, -1409, -1409, -1409, -1409, -1409, -1409, -1409 };
-signed short s1772[8] __attribute__((aligned(16))) = { 7258, 7258, 7258, 7258, 7258, 7258, 7258, 7258 };
-// 16-bit constants for IDCT calculation
-signed short s0414[8] __attribute__((aligned(16))) = { 1697 * 4, 1697 * 4, 1697 * 4, 1697 * 4, 1697 * 4, 1697 * 4, 1697 * 4, 1697 * 4 }; // 1.414213562 - 1.0
-signed short s1414[8] __attribute__((aligned(16))) = { 5793 * 4, 5793 * 4, 5793 * 4, 5793 * 4, 5793 * 4, 5793 * 4, 5793 * 4, 5793 * 4 }; // 1.414213562
-signed short s1847[8] __attribute__((aligned(16))) = { 7568 * 4, 7568 * 4, 7568 * 4, 7568 * 4, 7568 * 4, 7568 * 4, 7568 * 4, 7568 * 4 }; // 1.8477
-signed short s2613[8] __attribute__((aligned(16))) = { -10703 * 2, -10703 * 2, -10703 * 2, -10703 * 2, -10703 * 2, -10703 * 2, -10703 * 2, -10703 * 2 }; // -2.6131259
-signed short sp2613[8] __attribute__((aligned(16))) = { 10703 * 2, 10703 * 2, 10703 * 2, 10703 * 2, 10703 * 2, 10703 * 2, 10703 * 2, 10703 * 2 }; // 2.6131259
-signed short s1082[8] __attribute__((aligned(16))) = { 4433 * 4, 4433 * 4, 4433 * 4, 4433 * 4, 4433 * 4, 4433 * 4, 4433 * 4, 4433 * 4 }; // 1.08239
-signed short sfastDCT[8] __attribute__((aligned(16))) = { 4096, 4096, 4096, 4096, -815, 2320, 3472, 4096 };
+signed short s1402[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { 5742, 5742, 5742, 5742, 5742, 5742, 5742, 5742 };
+signed short s0714[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { -2925, -2925, -2925, -2925, -2925, -2925, -2925, -2925 };
+signed short s0344[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { -1409, -1409, -1409, -1409, -1409, -1409, -1409, -1409 };
+signed short s1772[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { 7258, 7258, 7258, 7258, 7258, 7258, 7258, 7258 };
+// 16-bit constants for IDCT calculation (cache-line aligned)
+signed short s0414[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { 1697 * 4, 1697 * 4, 1697 * 4, 1697 * 4, 1697 * 4, 1697 * 4, 1697 * 4, 1697 * 4 }; // 1.414213562 - 1.0
+signed short s1414[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { 5793 * 4, 5793 * 4, 5793 * 4, 5793 * 4, 5793 * 4, 5793 * 4, 5793 * 4, 5793 * 4 }; // 1.414213562
+signed short s1847[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { 7568 * 4, 7568 * 4, 7568 * 4, 7568 * 4, 7568 * 4, 7568 * 4, 7568 * 4, 7568 * 4 }; // 1.8477
+signed short s2613[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { -10703 * 2, -10703 * 2, -10703 * 2, -10703 * 2, -10703 * 2, -10703 * 2, -10703 * 2, -10703 * 2 }; // -2.6131259
+signed short sp2613[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { 10703 * 2, 10703 * 2, 10703 * 2, 10703 * 2, 10703 * 2, 10703 * 2, 10703 * 2, 10703 * 2 }; // 2.6131259
+signed short s1082[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { 4433 * 4, 4433 * 4, 4433 * 4, 4433 * 4, 4433 * 4, 4433 * 4, 4433 * 4, 4433 * 4 }; // 1.08239
+signed short sfastDCT[8] __attribute__((aligned(JPEG_CACHE_LINE_SIZE))) = { 4096, 4096, 4096, 4096, -815, 2320, 3472, 4096 };
 #else
 // 16-bit Constants for SSE ycc->rgb conversion
-__declspec(align(16)) signed short s1402[8] = {5742,5742,5742,5742,5742,5742,5742,5742};
-__declspec(align(16)) signed short s0714[8] = {-2925,-2925,-2925,-2925,-2925,-2925,-2925,-2925};
-__declspec(align(16)) signed short s0344[8] = {-1409,-1409,-1409,-1409,-1409,-1409,-1409,-1409};
-__declspec(align(16)) signed short s1772[8] = {7258,7258,7258,7258,7258,7258,7258,7258};
-// 16-bit constants for IDCT calculation
-__declspec(align(16)) signed short s0414[8] = {1697*4,1697*4,1697*4,1697*4,1697*4,1697*4,1697*4,1697*4}; // 1.414213562 - 1.0
-__declspec(align(16)) signed short s1414[8] = {5793*4,5793*4,5793*4,5793*4,5793*4,5793*4,5793*4,5793*4}; // 1.414213562
-__declspec(align(16)) signed short s1847[8] = {7568*4,7568*4,7568*4,7568*4,7568*4,7568*4,7568*4,7568*4}; // 1.8477
-__declspec(align(16)) signed short s2613[8] = {-10703*2,-10703*2,-10703*2,-10703*2,-10703*2,-10703*2,-10703*2,-10703*2}; // -2.6131259
-__declspec(align(16)) signed short sp2613[8] = {10703*2,10703*2,10703*2,10703*2,10703*2,10703*2,10703*2,10703*2}; // 2.6131259
-__declspec(align(16)) signed short s1082[8] = {4433*4,4433*4,4433*4,4433*4,4433*4,4433*4,4433*4,4433*4}; // 1.08239
-__declspec(align(16)) signed short sfastDCT[8] = {4096,4096,4096,4096,-815,2320,3472,4096};
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short s1402[8] = {5742,5742,5742,5742,5742,5742,5742,5742};
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short s0714[8] = {-2925,-2925,-2925,-2925,-2925,-2925,-2925,-2925};
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short s0344[8] = {-1409,-1409,-1409,-1409,-1409,-1409,-1409,-1409};
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short s1772[8] = {7258,7258,7258,7258,7258,7258,7258,7258};
+// 16-bit constants for IDCT calculation (cache-line aligned)
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short s0414[8] = {1697*4,1697*4,1697*4,1697*4,1697*4,1697*4,1697*4,1697*4}; // 1.414213562 - 1.0
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short s1414[8] = {5793*4,5793*4,5793*4,5793*4,5793*4,5793*4,5793*4,5793*4}; // 1.414213562
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short s1847[8] = {7568*4,7568*4,7568*4,7568*4,7568*4,7568*4,7568*4,7568*4}; // 1.8477
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short s2613[8] = {-10703*2,-10703*2,-10703*2,-10703*2,-10703*2,-10703*2,-10703*2,-10703*2}; // -2.6131259
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short sp2613[8] = {10703*2,10703*2,10703*2,10703*2,10703*2,10703*2,10703*2,10703*2}; // 2.6131259
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short s1082[8] = {4433*4,4433*4,4433*4,4433*4,4433*4,4433*4,4433*4,4433*4}; // 1.08239
+__declspec(align(JPEG_CACHE_LINE_SIZE)) signed short sfastDCT[8] = {4096,4096,4096,4096,-815,2320,3472,4096};
 #endif // GCC
 #endif // HAS_SSE
 
@@ -680,6 +715,7 @@ void JPEG_close(JPEGIMAGE *pJPEG)
 {
     if (pJPEG->pfnClose)
         (*pJPEG->pfnClose)(pJPEG->JPEGFile.fHandle);
+    JPEGReleaseAlignedBlock(pJPEG); // free cache-line aligned IDCT storage
 } /* JPEG_close() */
 
 #endif // !__cplusplus
@@ -1578,6 +1614,143 @@ static void JPEGGetMoreData(JPEGIMAGE *pPage)
 } /* JPEGGetMoreData() */
 
 //
+// Cache-line aligned working storage for the IDCT.
+// The public JPEGIMAGE layout must stay stable, so the cache-line
+// aligned buffers live in a per-instance heap allocation whose owner
+// and raw pointer are tracked in a small fixed registry below (no
+// pointer-sniffing into possibly-unowned memory). If the allocation
+// fails, a registry slot is unavailable or no allocator is present,
+// sMCUs/usPixels keep pointing at the original 16-byte aligned
+// in-struct arrays and every accessor transparently takes the fallback.
+//
+// Block layout (all region offsets are cache-line multiples):
+//   reserved head   0 .. 63
+//   MCU coefficients 64 ..    : DCTSIZE * MAX_MCU_COUNT int16's
+//   output pixels             : MAX_BUFFERED_PIXELS + 8 int16's
+//   quant. table shadow       : DCTSIZE * 4 int16's
+//
+#define JPEG_ALIGN_MCU_OFF      JPEG_CACHE_LINE_SIZE
+#define JPEG_ALIGN_PIX_OFF      (JPEG_ALIGN_MCU_OFF + (DCTSIZE * MAX_MCU_COUNT) * (int)sizeof(int16_t))
+#define JPEG_ALIGN_QUANT_OFF    (JPEG_ALIGN_PIX_OFF + (MAX_BUFFERED_PIXELS + 8) * (int)sizeof(int16_t))
+#define JPEG_ALIGN_BLOCK_SIZE   (((JPEG_ALIGN_QUANT_OFF + (DCTSIZE * 4) * (int)sizeof(int16_t)) + (JPEG_CACHE_LINE_SIZE - 1)) & ~(JPEG_CACHE_LINE_SIZE - 1))
+
+//
+// Registry of live aligned blocks. Ownership is tracked explicitly
+// rather than by walking backwards from sMCUs and dereferencing a
+// guessed header, which would read outside an allocation whenever
+// sMCUs points at any other (e.g. in-struct or caller-provided)
+// buffer. The decoder opens a small, fixed number of JPEGIMAGE
+// instances at a time; an over-full registry simply means the new
+// instance keeps the 16-byte aligned in-struct fallback buffers.
+//
+#define JPEG_ALIGN_MAX_INSTANCES 8
+typedef struct {
+    JPEGIMAGE *pOwner;   // instance this block belongs to
+    void *pRaw;          // original malloc pointer for free()
+    void *pBlock;        // cache-line aligned start
+} JPEG_ALIGN_ENTRY;
+static JPEG_ALIGN_ENTRY JPEG_alignRegistry[JPEG_ALIGN_MAX_INSTANCES];
+
+static void *JPEGAcquireAlignedBlock(JPEGIMAGE *pJPEG)
+{
+    uint8_t *pRaw, *pBlock;
+    uintptr_t ulAddr;
+    int i;
+
+    for (i = 0; i < JPEG_ALIGN_MAX_INSTANCES; i++)
+        if (JPEG_alignRegistry[i].pOwner == pJPEG)
+            return JPEG_alignRegistry[i].pBlock; // already registered
+    pRaw = (uint8_t *)malloc(JPEG_ALIGN_BLOCK_SIZE + JPEG_CACHE_LINE_SIZE);
+    if (pRaw == NULL)
+        return NULL;
+    ulAddr = (uintptr_t)pRaw + JPEG_CACHE_LINE_SIZE;
+    pBlock = (uint8_t *)(ulAddr & ~((uintptr_t)JPEG_CACHE_LINE_SIZE - 1));
+    for (i = 0; i < JPEG_ALIGN_MAX_INSTANCES; i++) {
+        if (JPEG_alignRegistry[i].pOwner == NULL) {
+            JPEG_alignRegistry[i].pOwner = pJPEG;
+            JPEG_alignRegistry[i].pRaw = pRaw;
+            JPEG_alignRegistry[i].pBlock = pBlock;
+            return pBlock;
+        }
+    }
+    free(pRaw); // no registry slot: caller falls back to in-struct buffers
+    return NULL;
+}
+
+// Returns the validated aligned block for this instance, or NULL when
+// only the 16-byte aligned in-struct fallback buffers are available.
+// Lookup is a bounded table scan; no pointer arithmetic on unowned
+// memory is performed.
+static void *JPEGValidatedAlignedBlock(JPEGIMAGE *pJPEG)
+{
+    int i;
+
+    for (i = 0; i < JPEG_ALIGN_MAX_INSTANCES; i++)
+        if (JPEG_alignRegistry[i].pOwner == pJPEG)
+            return JPEG_alignRegistry[i].pBlock;
+    return NULL;
+}
+
+static void JPEGReleaseAlignedBlock(JPEGIMAGE *pJPEG)
+{
+    int i;
+
+    for (i = 0; i < JPEG_ALIGN_MAX_INSTANCES; i++) {
+        if (JPEG_alignRegistry[i].pOwner == pJPEG) {
+            free(JPEG_alignRegistry[i].pRaw); // original malloc pointer
+            JPEG_alignRegistry[i].pOwner = NULL;
+            JPEG_alignRegistry[i].pRaw = NULL;
+            JPEG_alignRegistry[i].pBlock = NULL;
+            break;
+        }
+    }
+    // Drop the pointers so a re-open without an aligned block can never
+    // reference storage that was freed here.
+    pJPEG->sMCUs = NULL;
+    pJPEG->usPixels = NULL;
+}
+
+// Cache-line aligned shadow of the (re-ordered, pre-scaled) quant tables.
+// Falls back to the in-struct table when no aligned block is active.
+static int16_t *JPEGAlignedQuant(JPEGIMAGE *pJPEG)
+{
+    void *pBlock = JPEGValidatedAlignedBlock(pJPEG);
+
+    if (pBlock == NULL)
+        return &pJPEG->sQuantTable[0];
+    return (int16_t *)((uint8_t *)pBlock + JPEG_ALIGN_QUANT_OFF);
+}
+
+// Runtime query: which IDCT path is currently selected.
+static int JPEG_MAYBE_UNUSED JPEG_getIDCTBackend(void)
+{
+#if JPEG_IDCT_HAS_VECTOR
+    return JPEG_bForceGenericIDCT ? JPEG_IDCT_BACKEND_GENERIC
+                                  : JPEG_IDCT_BACKEND_VECTOR;
+#else
+    return JPEG_IDCT_BACKEND_GENERIC;
+#endif
+}
+
+// Runtime fallback switch: force the generic scalar IDCT even when a
+// vectorized path was compiled in. On builds without a vector path the
+// call is accepted but the generic path is the only one available.
+static void JPEG_MAYBE_UNUSED JPEG_forceGenericIDCT(int bForce)
+{
+#if JPEG_IDCT_HAS_VECTOR
+    JPEG_bForceGenericIDCT = bForce ? 1 : 0;
+#else
+    (void)bForce;
+#endif
+}
+
+// Runtime query: actual alignment of the IDCT working buffers.
+static int JPEG_MAYBE_UNUSED JPEG_getIDCTBufferAlignment(JPEGIMAGE *pJPEG)
+{
+    return JPEGValidatedAlignedBlock(pJPEG) ? JPEG_CACHE_LINE_SIZE : 16;
+}
+
+//
 // Parse the JPEG header, gather necessary info to decode the image
 // Returns 1 for success, 0 for failure
 //
@@ -1600,6 +1773,18 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
     i &= 15;
     if (i == 0) i = 16;
     pPage->sMCUs = &pPage->sUnalignedMCUs[(16-i)>>1];
+    // Prefer cache-line aligned working buffers for the IDCT. The block
+    // holds aligned MCU coefficients, output pixels and a quant table
+    // shadow; on allocation failure the 16-byte aligned in-struct
+    // buffers above remain in use and all code takes that fallback.
+    {
+        void *pAligned = JPEGAcquireAlignedBlock(pPage);
+        if (pAligned != NULL)
+        {
+            pPage->sMCUs = (int16_t *)((uint8_t *)pAligned + JPEG_ALIGN_MCU_OFF);
+            pPage->usPixels = (uint16_t *)((uint8_t *)pAligned + JPEG_ALIGN_PIX_OFF);
+        }
+    }
 
     if (bExtractThumb) // seek to the start of the thumbnail image
     {
@@ -1826,6 +2011,15 @@ static void JPEGFixQuantD(JPEGIMAGE *pJPEG)
         {
             p[i] = (uint16_t)((p[i] * iScaleBits[i]) >> 12);
         }
+    }
+    // Mirror the finished tables into the cache-line aligned shadow so
+    // the vectorized IDCT reads its multipliers without crossing a line.
+    // On the fallback path the shadow pointer is the in-struct table
+    // itself, making this a harmless self-copy-free no-op.
+    {
+        int16_t *pAlignedQuant = JPEGAlignedQuant(pJPEG);
+        if (pAlignedQuant != &pJPEG->sQuantTable[0])
+            memcpy(pAlignedQuant, &pJPEG->sQuantTable[0], DCTSIZE * 4 * sizeof(int16_t));
     }
 } /* JPEGFixQuantD() */
 /****************************************************************************
@@ -2297,6 +2491,31 @@ mcu_done:
 //
 // Inverse DCT
 //
+//
+// Optional diagnostic hook at the entry of every IDCT invocation.
+// The weak default does nothing, so production builds pay one predictable
+// call that resolves to an empty function and gets inlined/branched away
+// by modern compilers; tests may override the symbol to snapshot real
+// decoder-produced inputs (coefficients, quant table, MCU flags). No
+// public interface signature is affected.
+//
+#if defined(__GNUC__) && !defined(JPEGIDCT_HOOK_OVERRIDE)
+__attribute__((weak))
+void JPEGIDCT_debug_hook(JPEGIMAGE *pJPEG, int iMCUOffset, int iQuantTable,
+                         const int16_t *pMCUSrc, const int16_t *pQuant);
+void JPEGIDCT_debug_hook(JPEGIMAGE *pJPEG, int iMCUOffset, int iQuantTable,
+                         const int16_t *pMCUSrc, const int16_t *pQuant)
+{
+    (void)pJPEG; (void)iMCUOffset; (void)iQuantTable;
+    (void)pMCUSrc; (void)pQuant;
+}
+#elif defined(__GNUC__)
+// Strong override is provided by the test translation unit; declare the
+// prototype here so JPEGIDCT calls it without an implicit declaration.
+void JPEGIDCT_debug_hook(JPEGIMAGE *pJPEG, int iMCUOffset, int iQuantTable,
+                         const int16_t *pMCUSrc, const int16_t *pQuant);
+#endif
+
 static void JPEGIDCT(JPEGIMAGE *pJPEG, int iMCUOffset, int iQuantTable)
 {
     int iRow;
@@ -2323,7 +2542,10 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
     // my shortcut method appears to violate patent 20020080052
     // but the patent is invalidated by prior art:
     // http://netilium.org/~mad/dtj/DTJ/DTJK04/
-    pQuant = &pJPEG->sQuantTable[iQuantTable * DCTSIZE];
+    pQuant = JPEGAlignedQuant(pJPEG) + iQuantTable * DCTSIZE;
+#if defined(__GNUC__)
+    JPEGIDCT_debug_hook(pJPEG, iMCUOffset, iQuantTable, pMCUSrc, pQuant);
+#endif
     if (pJPEG->iOptions & JPEG_SCALE_QUARTER) // special case
     {
         /* Column 0 */
@@ -2346,14 +2568,23 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
         pOutput[3] = ucRangeTable[(((tmp2 - tmp3)>>5) & 0x3ff)];
         return;
     }
+//
+// Column pass: runtime dispatch between the compiled-in vector path
+// (SSE2/NEON) and the generic scalar path, which is always compiled.
+// When no vector backend exists (e.g. -DNO_SIMD, 32-bit MCUs) only the
+// generic block remains after preprocessing.
+//
+#if JPEG_IDCT_HAS_VECTOR
+    if (!JPEG_bForceGenericIDCT)
+    {
 #ifdef HAS_SSE // SSE2 version
     // Columns first
     // even part
     if ((u16MCUFlags & 0x2000) == 0) // rows 4-7 are not populated, simpler calculations
        {
        // even part
-       mmxTemp10 = _mm_loadu_si128((__m128i *)&pMCUSrc[0]); // row 0
-       mmxTemp1 = _mm_loadu_si128((__m128i *)&pMCUSrc[16]); // row 2
+       mmxTemp10 = _mm_load_si128((__m128i *)&pMCUSrc[0]); // row 0
+       mmxTemp1 = _mm_load_si128((__m128i *)&pMCUSrc[16]); // row 2
        mmxTemp = _mm_loadu_si128((__m128i *)&pQuant[0]);
        mmxTemp2 = _mm_loadu_si128((__m128i *)&pQuant[16]);
        mmxTemp10 = _mm_mullo_epi16(mmxTemp10, mmxTemp); // dequant row 0
@@ -2365,8 +2596,8 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
        mmxTemp1 = _mm_add_epi16(mmxTemp10, mmxTemp12); // 10+12
        mmxTemp2 = _mm_sub_epi16(mmxTemp10, mmxTemp12); // 10-12
        // odd part
-       mmxTemp4 = _mm_loadu_si128((__m128i *)&pMCUSrc[8]); // row 1
-       mmxTemp5 = _mm_loadu_si128((__m128i *)&pMCUSrc[24]); // row 3
+       mmxTemp4 = _mm_load_si128((__m128i *)&pMCUSrc[8]); // row 1
+       mmxTemp5 = _mm_load_si128((__m128i *)&pMCUSrc[24]); // row 3
        mmxTemp = _mm_loadu_si128((__m128i *)&pQuant[8]);
        mmxTemp11 = _mm_loadu_si128((__m128i *)&pQuant[24]);
        mmxTemp4 = _mm_mullo_epi16(mmxTemp4, mmxTemp); // dequant row 1
@@ -2390,16 +2621,16 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
     else // need to do full calculation
        {
        // even part
-       mmxTemp0 = _mm_loadu_si128((__m128i *)&pMCUSrc[0]); // get row 0
-       mmxTemp2 = _mm_loadu_si128((__m128i *)&pMCUSrc[32]); // get row 4
+       mmxTemp0 = _mm_load_si128((__m128i *)&pMCUSrc[0]); // get row 0
+       mmxTemp2 = _mm_load_si128((__m128i *)&pMCUSrc[32]); // get row 4
        mmxTemp10 = _mm_loadu_si128((__m128i *)&pQuant[0]);
        mmxTemp11 = _mm_loadu_si128((__m128i *)&pQuant[32]);
        mmxTemp0 = _mm_mullo_epi16(mmxTemp0, mmxTemp10); // dequant row 0
        mmxTemp2 = _mm_mullo_epi16(mmxTemp2, mmxTemp11); // dequant row 4
        mmxTemp10 = _mm_add_epi16(mmxTemp0, mmxTemp2); // 0+4
        mmxTemp11 = _mm_sub_epi16(mmxTemp0, mmxTemp2); // 0-4
-       mmxTemp1 = _mm_loadu_si128((__m128i *)&pMCUSrc[16]); // get row 2
-       mmxTemp3 = _mm_loadu_si128((__m128i *)&pMCUSrc[48]); // get row 6
+       mmxTemp1 = _mm_load_si128((__m128i *)&pMCUSrc[16]); // get row 2
+       mmxTemp3 = _mm_load_si128((__m128i *)&pMCUSrc[48]); // get row 6
        mmxTemp = _mm_loadu_si128((__m128i *)&pQuant[16]);
        mmxTemp12 = _mm_loadu_si128((__m128i *)&pQuant[48]);
        mmxTemp1 = _mm_mullo_epi16(mmxTemp1, mmxTemp); // dequant row 2
@@ -2412,16 +2643,16 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
        mmxTemp1 = _mm_add_epi16(mmxTemp11, mmxTemp12); // tmp1 = tmp11 + tmp12
        mmxTemp2 = _mm_sub_epi16(mmxTemp11, mmxTemp12); // tmp2 = tmp11 - tmp12
        // odd part
-       mmxTemp5 = _mm_loadu_si128((__m128i *)&pMCUSrc[24]); // get row 3
-       mmxTemp6 = _mm_loadu_si128((__m128i *)&pMCUSrc[40]); // get row 5
+       mmxTemp5 = _mm_load_si128((__m128i *)&pMCUSrc[24]); // get row 3
+       mmxTemp6 = _mm_load_si128((__m128i *)&pMCUSrc[40]); // get row 5
        mmxTemp10 = _mm_loadu_si128((__m128i *)&pQuant[24]);
        mmxTemp11 = _mm_loadu_si128((__m128i *)&pQuant[40]);
        mmxTemp5 = _mm_mullo_epi16(mmxTemp5, mmxTemp10); // dequant row 3
        mmxTemp6 = _mm_mullo_epi16(mmxTemp6, mmxTemp11); // dequant row 5
        mmxZ13 = _mm_add_epi16(mmxTemp6, mmxTemp5); // z13 = tmp6 + tmp5;
        mmxZ10 = _mm_sub_epi16(mmxTemp6, mmxTemp5); // z10 = tmp6 - tmp5;
-       mmxTemp4 = _mm_loadu_si128((__m128i *)&pMCUSrc[8]); // get row 1
-       mmxTemp7 = _mm_loadu_si128((__m128i *)&pMCUSrc[56]); // get row 7
+       mmxTemp4 = _mm_load_si128((__m128i *)&pMCUSrc[8]); // get row 1
+       mmxTemp7 = _mm_load_si128((__m128i *)&pMCUSrc[56]); // get row 7
        mmxTemp10 = _mm_loadu_si128((__m128i *)&pQuant[8]);
        mmxTemp11 = _mm_loadu_si128((__m128i *)&pQuant[56]);
        mmxTemp4 = _mm_mullo_epi16(mmxTemp4, mmxTemp10); // dequant row 1
@@ -2444,21 +2675,21 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
        mmxTemp4 = _mm_add_epi16(mmxTemp10, mmxTemp5); // tmp4 = tmp10 + tmp5;
        }
     mmxRow0 = _mm_add_epi16(mmxTemp0, mmxTemp7); // row 0
-    _mm_storeu_si128((__m128i *)&pMCUSrc[0], mmxRow0);
+    _mm_store_si128((__m128i *)&pMCUSrc[0], mmxRow0);
     mmxRow1 = _mm_add_epi16(mmxTemp1, mmxTemp6); // row 1
-    _mm_storeu_si128((__m128i *)&pMCUSrc[8], mmxRow1);
+    _mm_store_si128((__m128i *)&pMCUSrc[8], mmxRow1);
     mmxRow2 = _mm_add_epi16(mmxTemp2, mmxTemp5); // row 2
-    _mm_storeu_si128((__m128i *)&pMCUSrc[16], mmxRow2);
+    _mm_store_si128((__m128i *)&pMCUSrc[16], mmxRow2);
     mmxRow3 = _mm_sub_epi16(mmxTemp3, mmxTemp4); // row 3
-    _mm_storeu_si128((__m128i *)&pMCUSrc[24], mmxRow3);
+    _mm_store_si128((__m128i *)&pMCUSrc[24], mmxRow3);
     mmxRow4 = _mm_add_epi16(mmxTemp3, mmxTemp4); // row 4
-    _mm_storeu_si128((__m128i *)&pMCUSrc[32], mmxRow4);
+    _mm_store_si128((__m128i *)&pMCUSrc[32], mmxRow4);
     mmxRow5 = _mm_sub_epi16(mmxTemp2, mmxTemp5); // row 5
-    _mm_storeu_si128((__m128i *)&pMCUSrc[40], mmxRow5);
+    _mm_store_si128((__m128i *)&pMCUSrc[40], mmxRow5);
     mmxRow6 = _mm_sub_epi16(mmxTemp1, mmxTemp6); // row 6
-    _mm_storeu_si128((__m128i *)&pMCUSrc[48], mmxRow6);
+    _mm_store_si128((__m128i *)&pMCUSrc[48], mmxRow6);
     mmxRow7 = _mm_sub_epi16(mmxTemp0, mmxTemp7); // row 7
-    _mm_storeu_si128((__m128i *)&pMCUSrc[56], mmxRow7);
+    _mm_store_si128((__m128i *)&pMCUSrc[56], mmxRow7);
 #endif // HAS_SSE
 #ifdef HAS_NEON
         if ((u16MCUFlags & 0x2000) == 0) // rows 4-7 are not populated, simpler calculations
@@ -2572,7 +2803,13 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
         mmxRow7 = vsubq_s16(mmxTemp0, mmxTemp7); // row 7
         vst1q_s16(&pMCUSrc[56], mmxRow7);
 #endif // HAS_NEON
-#if !defined (HAS_SSE) && !defined(HAS_NEON)
+    }
+    else
+#endif // JPEG_IDCT_HAS_VECTOR
+    {
+    // Generic scalar column pass. Always compiled; selected when no
+    // vector backend exists or the runtime fallback was requested.
+    // This is the original reference code, unchanged pixel-for-pixel.
     // do columns first
     u16MCUFlags |= 1; // column 0 must always be calculated
     for (int iCol = 0; iCol < 8 && u16MCUFlags; iCol++)
@@ -2698,7 +2935,9 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
             } // full calculation needed
         } // if column has data in it
     } // for each column
-#endif // NO SIMD
+    } // generic scalar column pass
+#if JPEG_IDCT_HAS_VECTOR
+#endif // runtime vector/generic dispatch
     // now do rows
     u16MCUFlags = pJPEG->u16MCUFlags;
     pOutput = (unsigned char *)pMCUSrc; // store output pixels back into MCU
