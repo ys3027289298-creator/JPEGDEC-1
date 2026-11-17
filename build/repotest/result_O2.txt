@@ -1,0 +1,27 @@
+Line: 79: msg: JPEG full image decode - START
+Line: 86: msg: JPEG full image decode - PASSED
+Line: 109: msg: JPEG full image decode - START
+Line: 118: msg: JPEG full image decode - PASSED
+Line: 141: msg: JPEG color->gray image decode - START
+100 iterations: color decode - 108430 us, grayscale decode - 82149 us
+Line: 162: msg: JPEG color->gray image decode - FAILED
+Line: 167: msg: JPEG purposely corrupt image 1 - START
+Line: 172: msg: JPEG purposely corrupt image 1 - PASSED
+Line: 177: msg: JPEG purposely corrupt image 2 - START
+Line: 182: msg: JPEG purposely corrupt image 2 - PASSED
+Line: 188: msg: JPEG purposely corrupt image 3 - START
+Line: 193: msg: JPEG purposely corrupt image 3 - PASSED
+Line: 199: msg: JPEG purposely corrupt image 4 - START
+Line: 204: msg: JPEG purposely corrupt image 4 - PASSED
+Line: 210: msg: JPEG purposely corrupt image 5 - START
+Line: 215: msg: JPEG purposely corrupt image 5 - PASSED
+Line: 223: msg: JPEG DMA ping-pong buffer - START
+Line: 229: msg: JPEG DMA ping-pong buffer - PASSED
+Line: 239: msg: JPEG EXIF Thumbnail - START
+Line: 250: msg: JPEG EXIF Thumbnail - PASSED
+Begin fuzz testing...
+Line: 269: msg: Single Byte Sequential Corruption Test - START
+Line: 280: msg: Single Byte Sequential Corruption Test - PASSED
+Line: 286: msg: Multi-Byte Random Corruption Test - START
+Line: 299: msg: Multi-Byte Random Corruption Test - PASSED
+Total tests: 12, 11 passed, 1 failed

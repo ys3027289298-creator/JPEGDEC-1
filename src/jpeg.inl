@@ -1562,7 +1562,10 @@ static void JPEGGetMoreData(JPEGIMAGE *pPage)
         return; // buffer is already full; no need to read more data
     if (pPage->iVLCOff != 0)
     {
-        memcpy(pPage->ucFileBuf, &pPage->ucFileBuf[pPage->iVLCOff], pPage->iVLCSize - pPage->iVLCOff);
+        // Source and destination overlap inside ucFileBuf whenever the
+        // consumed prefix is shorter than the remaining data; memmove is
+        // required (memcpy on overlapping ranges is undefined behavior).
+        memmove(pPage->ucFileBuf, &pPage->ucFileBuf[pPage->iVLCOff], pPage->iVLCSize - pPage->iVLCOff);
         pPage->iVLCSize -= pPage->iVLCOff;
         pPage->iVLCOff = 0;
         pPage->bb.pBuf = pPage->ucFileBuf; // reset VLC source pointer too
@@ -1576,6 +1579,354 @@ static void JPEGGetMoreData(JPEGIMAGE *pPage)
         pPage->iVLCSize += JPEGFilter(&pPage->ucFileBuf[pPage->iVLCSize], &pPage->ucFileBuf[pPage->iVLCSize], i, &pPage->ucFF);
     }
 } /* JPEGGetMoreData() */
+
+//===========================================================================
+//
+// MCU error recovery
+//
+// Surveillance captures occasionally contain a damaged MCU (bad bitstream
+// or storage corruption). An invalid Huffman code used to stop the whole
+// decode; this module keeps going instead:
+//
+// 1. If restart markers are present, scan the *raw* (unfiltered) file data
+//    for the next RST marker, reload the VLC buffer there and reset the DC
+//    predictors. Every MCU inside the lost interval is filled from a
+//    neighbor block.
+// 2. Without restart markers there is no recoverable MCU boundary, so the
+//    bitstream is advanced to the next byte boundary and only the current
+//    MCU is dropped and filled; decoding continues and any MCU that still
+//    fails is skipped one at a time.
+//
+// All configuration and counters are file-scope; the public configuration
+// functions never touch existing decoder entry points or signatures.
+//
+//===========================================================================
+
+// Fill policies for a damaged MCU
+#define JPEG_FILL_LEFT    0 // copy the MCU to the left (default)
+#define JPEG_FILL_ABOVE   1 // copy the MCU above
+#define JPEG_FILL_NEUTRAL 2 // fill with mid-gray
+
+#define JPEG_REC_DEFAULT_RANGE 4096 // default raw-data resync scan window
+#define JPEG_REC_MAX_RANGE     1000000
+
+static int g_iRecEnabled = 1;
+static int g_iRecSearchRange = JPEG_REC_DEFAULT_RANGE;
+static int g_iRecFillPolicy = JPEG_FILL_LEFT;
+// per-decode counters (reset at the start of each DecodeJPEG)
+static int g_iRecHuffErrors = 0;   // invalid Huffman code events
+static int g_iRecBadMCUs = 0;      // MCUs whose pixels were filled
+static int g_iRecRSTRecoveries = 0;// resyncs performed at a restart marker
+static int g_iRecSkipRecoveries = 0;// single-MCU skips (no marker found)
+static int64_t g_iRecPixelsTotal = 0;   // visible pixels in the image
+static int64_t g_iRecPixelsDamaged = 0; // visible pixels inside filled MCUs
+// raw file offset of the first entropy byte after the SOS segment
+static int g_iRecEntropyRawStart = 0;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+//
+// Configuration entry points. Invalid parameters return
+// JPEG_INVALID_PARAMETER and leave the current configuration untouched.
+//
+int JPEG_RECOVERY_setEnabled(int bEnable)
+{
+    if (bEnable != 0 && bEnable != 1)
+        return JPEG_INVALID_PARAMETER;
+    g_iRecEnabled = bEnable;
+    return JPEG_SUCCESS;
+}
+int JPEG_RECOVERY_setSearchRange(int iRange)
+{
+    if (iRange < 1 || iRange > JPEG_REC_MAX_RANGE)
+        return JPEG_INVALID_PARAMETER;
+    g_iRecSearchRange = iRange;
+    return JPEG_SUCCESS;
+}
+int JPEG_RECOVERY_setFillPolicy(int iPolicy)
+{
+    if (iPolicy < JPEG_FILL_LEFT || iPolicy > JPEG_FILL_NEUTRAL)
+        return JPEG_INVALID_PARAMETER;
+    g_iRecFillPolicy = iPolicy;
+    return JPEG_SUCCESS;
+}
+int JPEG_RECOVERY_getEnabled(void) { return g_iRecEnabled; }
+int JPEG_RECOVERY_getSearchRange(void) { return g_iRecSearchRange; }
+int JPEG_RECOVERY_getFillPolicy(void) { return g_iRecFillPolicy; }
+int JPEG_RECOVERY_getHuffErrors(void) { return g_iRecHuffErrors; }
+int JPEG_RECOVERY_getBadMCUs(void) { return g_iRecBadMCUs; }
+int JPEG_RECOVERY_getRSTRecoveries(void) { return g_iRecRSTRecoveries; }
+int JPEG_RECOVERY_getSkipRecoveries(void) { return g_iRecSkipRecoveries; }
+int64_t JPEG_RECOVERY_getPixelsTotal(void) { return g_iRecPixelsTotal; }
+int64_t JPEG_RECOVERY_getPixelsDamaged(void) { return g_iRecPixelsDamaged; }
+double JPEG_RECOVERY_getRecoveryRatio(void)
+{
+    if (g_iRecPixelsTotal == 0)
+        return 1.0;
+    return (double)(g_iRecPixelsTotal - g_iRecPixelsDamaged) /
+           (double)g_iRecPixelsTotal;
+}
+#ifdef __cplusplus
+}
+#endif
+
+// Bytes per output pixel for the active pixel type (dithered output is
+// always drawn into a 16-bit dither buffer).
+static int JPEGRecBytesPerPixel(JPEGIMAGE *pJPEG)
+{
+    if (pJPEG->ucPixelType == RGB8888)
+        return 4;
+    if (pJPEG->ucPixelType == EIGHT_BIT_GRAYSCALE)
+        return 1;
+    return 2; // RGB565 and the dithered formats
+}
+
+// Visible (clipped) size of an MCU at grid position (x,y). MCUs past the
+// right/bottom image edge still decode fully but only the overlap counts.
+static void JPEGRecVisible(JPEGIMAGE *pJPEG, int x, int y,
+                           int mcuCX, int mcuCY, int iScaleShift,
+                           int *pVisX, int *pVisY)
+{
+    int iW = pJPEG->iCropCX >> iScaleShift;
+    int iH = pJPEG->iCropCY >> iScaleShift;
+    int iX = x * mcuCX;
+    int iY = y * mcuCY;
+    int vx = mcuCX, vy = mcuCY;
+    if (iX + vx > iW) vx = iW - iX;
+    if (iY + vy > iH) vy = iH - iY;
+    if (vx < 0) vx = 0;
+    if (vy < 0) vy = 0;
+    *pVisX = vx;
+    *pVisY = vy;
+}
+
+//
+// Replace the pixels of one damaged MCU using the configured fill policy.
+// Works for both the internal draw buffer and a user-supplied framebuffer.
+//
+static void JPEGRecFillMCU(JPEGIMAGE *pJPEG, int x, int y,
+                           int xoff, int iPitch, int mcuCX, int mcuCY)
+{
+    int iBpp, iVisX, iVisY, iRow, iCol;
+    int iPitchBytes, iDestSize, iFillShift;
+    uint8_t *pDest, *pSrc, neutral[4];
+
+    if (pJPEG->iOptions & JPEG_SCALE_HALF)
+        iFillShift = 1;
+    else if (pJPEG->iOptions & JPEG_SCALE_QUARTER)
+        iFillShift = 2;
+    else if (pJPEG->iOptions & JPEG_SCALE_EIGHTH)
+        iFillShift = 3;
+    else
+        iFillShift = 0;
+    JPEGRecVisible(pJPEG, x, y, mcuCX, mcuCY, iFillShift, &iVisX, &iVisY);
+    if (iVisX <= 0 || iVisY <= 0)
+        return; // nothing visible (fully outside the crop area)
+    iBpp = JPEGRecBytesPerPixel(pJPEG);
+
+    if (pJPEG->pFramebuffer) {
+        iPitchBytes = iPitch * iBpp;
+        // the y-loop points usPixels at the start of this output row
+        pDest = (uint8_t *)pJPEG->usPixels + (xoff * iBpp);
+    } else if (pJPEG->ucPixelType > EIGHT_BIT_GRAYSCALE && pJPEG->pDitherBuffer) {
+        iPitchBytes = iPitch * 2;
+        pDest = (uint8_t *)pJPEG->pDitherBuffer + (xoff * 2);
+    } else {
+        iPitchBytes = iPitch * iBpp;
+        // usPixels is re-based to the current row group at every MCU
+        pDest = (uint8_t *)pJPEG->usPixels + (xoff * iBpp);
+    }
+
+    if (g_iRecFillPolicy == JPEG_FILL_NEUTRAL)
+    {
+        if (pJPEG->ucPixelType == RGB8888)
+        {
+            neutral[0] = 0x80; neutral[1] = 0x80; // B, G
+            neutral[2] = 0x80; neutral[3] = 0xff; // R, A
+        }
+        else if (pJPEG->ucPixelType == EIGHT_BIT_GRAYSCALE)
+        {
+            neutral[0] = 0x80;
+        }
+        else if (pJPEG->ucPixelType == RGB565_BIG_ENDIAN)
+        {
+            neutral[0] = 0x10; neutral[1] = 0x84;
+        }
+        else // RGB565 LE and the 1/2/4-bit dither buffer (16-bit cells)
+        {
+            neutral[0] = 0x10; neutral[1] = 0x84;
+        }
+        iDestSize = iVisX * iBpp;
+        for (iRow = 0; iRow < iVisY; iRow++)
+        {
+            uint8_t *p = pDest + iRow * iPitchBytes;
+            for (iCol = 0; iCol < iDestSize; iCol++)
+                p[iCol] = neutral[iCol % iBpp];
+        }
+        return;
+    }
+
+    // The left neighbor is usable only when it actually lives in the
+    // current buffer: in internal-buffer mode a draw group starts at
+    // xoff == 0, so an MCU at a group boundary has no left neighbor to
+    // copy and must fall back to the neutral fill.
+    if (g_iRecFillPolicy == JPEG_FILL_LEFT && x > 0 && xoff >= mcuCX)
+    {
+        iDestSize = iVisX * iBpp;
+        pSrc = pDest - (mcuCX * iBpp); // the MCU immediately to the left
+        for (iRow = 0; iRow < iVisY; iRow++)
+            memcpy(pDest + iRow * iPitchBytes, pSrc + iRow * iPitchBytes,
+                   (size_t)iDestSize);
+        return;
+    }
+
+    if (g_iRecFillPolicy == JPEG_FILL_ABOVE && y > 0 && pJPEG->pFramebuffer)
+    {
+        // Only framebuffers keep the rows above; the internal draw buffer
+        // is reused for every row and cannot serve as a source.
+        iDestSize = iVisX * iBpp;
+        pSrc = pDest - (mcuCY * iPitchBytes); // the MCU immediately above
+        for (iRow = 0; iRow < iVisY; iRow++)
+            memcpy(pDest + iRow * iPitchBytes, pSrc + iRow * iPitchBytes,
+                   (size_t)iDestSize);
+        return;
+    }
+
+    // No usable neighbor (first column for LEFT, first row or internal
+    // buffer for ABOVE): fall back to a neutral fill.
+    if (pJPEG->ucPixelType == RGB8888)
+    {
+        neutral[0] = 0x80; neutral[1] = 0x80;
+        neutral[2] = 0x80; neutral[3] = 0xff;
+    }
+    else if (pJPEG->ucPixelType == EIGHT_BIT_GRAYSCALE)
+    {
+        neutral[0] = 0x80;
+    }
+    else if (pJPEG->ucPixelType == RGB565_BIG_ENDIAN)
+    {
+        neutral[0] = 0x10; neutral[1] = 0x84;
+    }
+    else
+    {
+        neutral[0] = 0x10; neutral[1] = 0x84;
+    }
+    iDestSize = iVisX * iBpp;
+    for (iRow = 0; iRow < iVisY; iRow++)
+    {
+        uint8_t *p = pDest + iRow * iPitchBytes;
+        for (iCol = 0; iCol < iDestSize; iCol++)
+            p[iCol] = neutral[iCol % iBpp];
+    }
+} /* JPEGRecFillMCU() */
+
+//
+// Search the raw (marker-bearing) file data for the next RST marker.
+// FF00 is byte stuffing and skipped; any other marker ends the entropy
+// segment. Returns the raw offset just past the RST marker, or -1.
+//
+static int JPEGRecFindRST(JPEGIMAGE *pJPEG, int iRawPos, int iLimit)
+{
+    int iEnd, i;
+    const uint8_t *pData;
+
+    if (pJPEG->ucMemType != JPEG_MEM_RAM && pJPEG->ucMemType != JPEG_MEM_FLASH)
+        return -1; // raw scan needs the whole image resident in memory
+    pData = pJPEG->JPEGFile.pData;
+    if (pData == NULL || iRawPos < 0)
+        return -1;
+    iEnd = iRawPos + iLimit;
+    if (iEnd > pJPEG->JPEGFile.iSize - 1)
+        iEnd = pJPEG->JPEGFile.iSize - 1;
+    for (i = iRawPos; i < iEnd; i++)
+    {
+        if (pData[i] != 0xff)
+            continue;
+        if (i + 1 >= pJPEG->JPEGFile.iSize)
+            break;
+        if (pData[i + 1] == 0x00)
+        {
+            i++; // stuffed zero, keep scanning
+            continue;
+        }
+        if (pData[i + 1] >= 0xd0 && pData[i + 1] <= 0xd7)
+            return i + 2; // restart marker found
+        if (pData[i + 1] == 0xd9 || pData[i + 1] == 0xda)
+            break; // EOI / new SOS: the entropy segment ends here
+    }
+    return -1;
+} /* JPEGRecFindRST() */
+
+//
+// Rebuild the filtered VLC buffer starting at the given raw file offset.
+// The bit reader is positioned on the first bit of the new data.
+//
+static void JPEGRecReloadVLC(JPEGIMAGE *pJPEG, int iRawPos)
+{
+    int i;
+
+    if (iRawPos < 0)
+        iRawPos = 0;
+    else if (iRawPos > pJPEG->JPEGFile.iSize)
+        iRawPos = pJPEG->JPEGFile.iSize;
+    (*pJPEG->pfnSeek)(&pJPEG->JPEGFile, iRawPos);
+    pJPEG->ucFF = 0;
+    pJPEG->iVLCOff = 0;
+    pJPEG->iVLCSize = 0;
+    // JPEGFilter can only shrink its input (markers/stuffed zeros are
+    // removed), so reading at most the buffer capacity guarantees the
+    // filtered output fits and leaves headroom for JPEGGetMoreData.
+    i = (*pJPEG->pfnRead)(&pJPEG->JPEGFile, pJPEG->ucFileBuf,
+                          JPEG_FILE_BUF_SIZE - 64);
+    pJPEG->iVLCSize = JPEGFilter(pJPEG->ucFileBuf, pJPEG->ucFileBuf,
+                                 i, &pJPEG->ucFF);
+    pJPEG->bb.pBuf = pJPEG->ucFileBuf;
+    pJPEG->bb.ulBitOff = 0;
+    pJPEG->bb.ulBits = MOTOLONG(pJPEG->ucFileBuf);
+    JPEGGetMoreData(pJPEG); // top the buffer up with the following data
+} /* JPEGRecReloadVLC() */
+
+//
+// Advance the bitstream to the next byte boundary (single-MCU skip path
+// for images without usable restart markers).
+//
+static void JPEGRecSkipToNextByte(JPEGIMAGE *pJPEG)
+{
+    int iDelta;
+
+    JPEGGetMoreData(pJPEG); // make sure the buffer is full first
+    iDelta = (8 - (pJPEG->bb.ulBitOff & 7)) & 7;
+    pJPEG->bb.ulBitOff += iDelta;
+    if (pJPEG->bb.ulBitOff >= 8)
+    {
+        int iBytes = pJPEG->bb.ulBitOff >> 3;
+        pJPEG->bb.pBuf += iBytes;
+        pJPEG->iVLCOff = (int)(pJPEG->bb.pBuf - pJPEG->ucFileBuf);
+        pJPEG->bb.ulBitOff &= 7;
+        pJPEG->bb.ulBits = MOTOLONG(pJPEG->bb.pBuf);
+    }
+} /* JPEGRecSkipToNextByte() */
+
+//
+// Best-effort raw offset of the bit the decoder is currently parked on.
+// JPEGFilter removes stuffed zeros and markers, so the filtered offset is
+// only an estimate; the raw read position is used as a lower bound. Used
+// only to bound the restart-marker scan.
+//
+static int JPEGRecCurrentRawPos(JPEGIMAGE *pJPEG)
+{
+    int iFilteredPos = pJPEG->iVLCOff + (pJPEG->bb.ulBitOff >> 3);
+    int iPos = g_iRecEntropyRawStart + iFilteredPos;
+    int iReadPos = pJPEG->JPEGFile.iPos - JPEG_FILE_BUF_SIZE;
+    if (iReadPos > iPos)
+        iPos = iReadPos;
+    if (iPos < 0)
+        iPos = 0;
+    if (iPos > pJPEG->JPEGFile.iSize)
+        iPos = pJPEG->JPEGFile.iSize;
+    return iPos;
+} /* JPEGRecCurrentRawPos() */
 
 //
 // Parse the JPEG header, gather necessary info to decode the image
@@ -1793,6 +2144,9 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
             return 0;
         }
         // Now the offset points to the start of compressed data
+        // Remember its raw file offset so the recovery code can scan for
+        // restart markers in the unfiltered data later.
+        g_iRecEntropyRawStart = pPage->JPEGFile.iPos - (iBytesRead - iOffset);
         i = JPEGFilter(&pPage->ucFileBuf[iOffset], pPage->ucFileBuf, iBytesRead-iOffset, &pPage->ucFF);
         pPage->iVLCOff = 0;
         pPage->iVLCSize = i;
@@ -5035,6 +5389,18 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     unsigned char cDCTable0, cACTable0, cDCTable1, cACTable1, cDCTable2, cACTable2;
     JPEGDRAW jd;
     int iMaxFill = 16, iScaleShift = 0;
+    // MCU error recovery state
+    int iMCUBad = 0;        // the current MCU hit an invalid Huffman code
+    int iMCUSkipLeft = 0;   // MCUs still to skip after a restart resync
+    int iVisX, iVisY, iRawPos, iRSTPos, iBadRun;
+
+    // Reset the per-decode recovery counters and visible-pixel totals
+    g_iRecHuffErrors = 0;
+    g_iRecBadMCUs = 0;
+    g_iRecRSTRecoveries = 0;
+    g_iRecSkipRecoveries = 0;
+    g_iRecPixelsDamaged = 0;
+    g_iRecPixelsTotal = 0;
 
     // Requested the Exif thumbnail
     if (pJPEG->ucMode == 0xc2) { // progressive mode - we only decode the first scan (DC values)
@@ -5134,6 +5500,13 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     iLum3 = MCU3;
     iErr = 0;
     pJPEG->iResCount = pJPEG->iResInterval;
+    // An unsupported/garbled subsampling value leaves mcuCX/mcuCY at zero;
+    // reject it instead of dividing by zero below.
+    if (mcuCX <= 0 || mcuCY <= 0)
+    {
+        pJPEG->iError = JPEG_DECODE_ERROR;
+        return 0;
+    }
     // Calculate how many MCUs we can fit in the pixel buffer to maximize LCD drawing speed
     iMCUCount = MAX_BUFFERED_PIXELS / (mcuCX * mcuCY);
     if (pJPEG->ucPixelType == RGB8888) {
@@ -5182,6 +5555,10 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     else
         jd.pPixels = pJPEG->usPixels;
     jd.iHeight = mcuCY;
+    // Total number of pixels that can be delivered for this decode; the
+    // recovery ratio is computed against it.
+    g_iRecPixelsTotal = (int64_t)(pJPEG->iCropCX >> iScaleShift) *
+                        (pJPEG->iCropCY >> iScaleShift);
     for (y = 0; y < cy && bContinue && iErr == 0; y++)
     {
         bSkipRow = (y*mcuCY < pJPEG->iCropY);
@@ -5204,13 +5581,24 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
         for (x = 0; x < cx && bContinue && iErr == 0; x++)
         {
             if (pJPEG->pFramebuffer == NULL) {
-                pJPEG->usPixels = &pAlignedPixels[iDMAOffset]; // make sure output is correct offset for DMA   
+                pJPEG->usPixels = &pAlignedPixels[iDMAOffset]; // make sure output is correct offset for DMA
             }
 
             iSkipMask = 0; // assume not skipping
             if (pJPEG->ucMode != 0x52 && (bSkipRow || x*mcuCX < pJPEG->iCropX || x*mcuCX > pJPEG->iCropX+pJPEG->iCropCX)) {
                 iSkipMask = MCU_SKIP;
             }
+            if (iMCUSkipLeft > 0)
+            {
+                // Part of a restart interval abandoned by a resync: do not
+                // consume any bitstream data, just fill the pixels and run
+                // the normal end-of-MCU bookkeeping below.
+                iMCUSkipLeft--;
+                iMCUBad = 1;
+                goto mcu_fill;
+            }
+            iMCUBad = 0;
+
             pJPEG->ucACTable = cACTable0;
             pJPEG->ucDCTable = cDCTable0;
             // do the first luminance component
@@ -5218,6 +5606,7 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                 iErr = JPEGDecodeMCU_P(pJPEG, iLum0 | iSkipMask, &iDCPred0);
             } else {
                 iErr = JPEGDecodeMCU(pJPEG, iLum0 | iSkipMask, &iDCPred0);
+                if (iErr != 0) goto mcu_huff_error; // invalid Huffman code
             }
             if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
             {
@@ -5238,7 +5627,8 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                 if (pJPEG->ucMode == 0xc2) { // progressive
                     iErr |= JPEGDecodeMCU_P(pJPEG, iLum1 | iSkipMask, &iDCPred0);
                 } else {
-                    iErr |= JPEGDecodeMCU(pJPEG, iLum1 | iSkipMask, &iDCPred0);
+                    iErr = JPEGDecodeMCU(pJPEG, iLum1 | iSkipMask, &iDCPred0);
+                    if (iErr != 0) goto mcu_huff_error;
                 }
                 if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
                 {
@@ -5258,7 +5648,8 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                     if (pJPEG->ucMode == 0xc2) { // progressive
                         iErr |= JPEGDecodeMCU_P(pJPEG, iLum2 | iSkipMask, &iDCPred0);
                     } else {
-                        iErr |= JPEGDecodeMCU(pJPEG, iLum2 | iSkipMask, &iDCPred0);
+                        iErr = JPEGDecodeMCU(pJPEG, iLum2 | iSkipMask, &iDCPred0);
+                        if (iErr != 0) goto mcu_huff_error;
                     }
                     if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
                     {
@@ -5276,7 +5667,8 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                     if (pJPEG->ucMode == 0xc2) { // progressive
                         iErr |= JPEGDecodeMCU_P(pJPEG, iLum3 | iSkipMask, &iDCPred0);
                     } else {
-                        iErr |= JPEGDecodeMCU(pJPEG, iLum3 | iSkipMask, &iDCPred0);
+                        iErr = JPEGDecodeMCU(pJPEG, iLum3 | iSkipMask, &iDCPred0);
+                        if (iErr != 0) goto mcu_huff_error;
                     }
                     if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
                     {
@@ -5304,14 +5696,17 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                         iErr |= JPEGDecodeMCU_P(pJPEG, MCU_SKIP, &iDCPred1);
                         iErr |= JPEGDecodeMCU_P(pJPEG, MCU_SKIP, &iDCPred2);
                     } else {
-                        iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred1); // decode Cr block
-                        iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred2); // decode Cb block
+                        iErr = JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred1); // decode Cr block
+                        if (iErr != 0) goto mcu_huff_error;
+                        iErr = JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred2); // decode Cb block
+                        if (iErr != 0) goto mcu_huff_error;
                     }
                 } else {
                     if (pJPEG->ucMode == 0xc2) { // progressive
                         iErr |= JPEGDecodeMCU_P(pJPEG, iCr | iSkipMask, &iDCPred1);
                     } else {
-                        iErr |= JPEGDecodeMCU(pJPEG, iCr | iSkipMask, &iDCPred1);
+                        iErr = JPEGDecodeMCU(pJPEG, iCr | iSkipMask, &iDCPred1);
+                        if (iErr != 0) goto mcu_huff_error;
                     }
                     if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
                     {
@@ -5332,7 +5727,8 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                     if (pJPEG->ucMode == 0xc2) { // progressive
                         iErr |= JPEGDecodeMCU_P(pJPEG, iCb | iSkipMask, &iDCPred2);
                     } else {
-                        iErr |= JPEGDecodeMCU(pJPEG, iCb | iSkipMask, &iDCPred2);
+                        iErr = JPEGDecodeMCU(pJPEG, iCb | iSkipMask, &iDCPred2);
+                        if (iErr != 0) goto mcu_huff_error;
                     }
                     if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
                     {
@@ -5349,28 +5745,82 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                     }
                 }
             } // if color components present
+            goto mcu_tail; // healthy MCU: skip the error entry point
+
+        mcu_huff_error:
+            // An invalid Huffman code was returned for the current MCU.
+            // Keep the legacy fail-stop behavior when recovery is off or
+            // for progressive scans (only baseline entropy is resyncable).
+            if (!g_iRecEnabled || pJPEG->ucMode == 0xc2)
+            {
+                pJPEG->iError = JPEG_DECODE_ERROR;
+                return 0;
+            }
+            iMCUBad = 1;
+            iErr = 0; // the decode continues; iError stays JPEG_SUCCESS
+            g_iRecHuffErrors++;
+            iBadRun = pJPEG->iResInterval ? pJPEG->iResCount : 1;
+            iRawPos = JPEGRecCurrentRawPos(pJPEG);
+            iRSTPos = -1;
+            if (pJPEG->iResInterval)
+                iRSTPos = JPEGRecFindRST(pJPEG, iRawPos, g_iRecSearchRange);
+            if (iRSTPos >= 0)
+            {
+                // Resync at the next restart marker: every MCU still
+                // expected inside this interval is filled instead.
+                g_iRecRSTRecoveries++;
+                iMCUSkipLeft = iBadRun - 1;
+                JPEGRecReloadVLC(pJPEG, iRSTPos);
+                iDCPred0 = iDCPred1 = iDCPred2 = 0;
+                // Count down from the run length, not the full interval:
+                // the bad MCU plus the skipped MCUs must bring iResCount to
+                // zero exactly at this boundary so later intervals stay in
+                // sync (a wrong reset mid-interval would corrupt DCs).
+                pJPEG->iResCount = iBadRun;
+            }
+            else
+            {
+                // No usable marker: drop just this MCU and resume at the
+                // next byte boundary; DC predictors stay untouched.
+                g_iRecSkipRecoveries++;
+                iMCUSkipLeft = 0;
+                JPEGRecSkipToNextByte(pJPEG);
+            }
+
+        mcu_fill:
+            if (iMCUBad)
+            {
+                g_iRecBadMCUs++;
+                JPEGRecVisible(pJPEG, x, y, mcuCX, mcuCY, iScaleShift, &iVisX, &iVisY);
+                g_iRecPixelsDamaged += (int64_t)iVisX * (int64_t)iVisY;
+                if (!iSkipMask)
+                    JPEGRecFillMCU(pJPEG, x, y, xoff, iPitch, mcuCX, mcuCY);
+            }
+        mcu_tail:
             if (!iSkipMask) { // this MCU is not skipped
-                if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
-                    JPEGPutMCU8BitGray(pJPEG, xoff, iPitch); // grayscale or color is being drawn as grayscale
-                } else {
-                    switch (pJPEG->ucSubSample) {
-                        case 0x00: // grayscale
-                            JPEGPutMCUGray(pJPEG, xoff, iPitch);
-                            break;
-                        case 0x11:
-                            JPEGPutMCU11(pJPEG, xoff, iPitch);
-                            break;
-                        case 0x12:
-                            JPEGPutMCU12(pJPEG, xoff, iPitch);
-                            break;
-                        case 0x21:
-                            JPEGPutMCU21(pJPEG, xoff, iPitch);
-                            break;
-                        case 0x22:
-                            JPEGPutMCU22(pJPEG, xoff, iPitch);
-                            break;
-                    } // switch on color option
-                } // normal MCU drawing
+                if (!iMCUBad) {
+                    if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
+                        JPEGPutMCU8BitGray(pJPEG, xoff, iPitch); // grayscale or color is being drawn as grayscale
+                    } else {
+                        switch (pJPEG->ucSubSample) {
+                            case 0x00: // grayscale
+                                JPEGPutMCUGray(pJPEG, xoff, iPitch);
+                                break;
+                            case 0x11:
+                                JPEGPutMCU11(pJPEG, xoff, iPitch);
+                                break;
+                            case 0x12:
+                                JPEGPutMCU12(pJPEG, xoff, iPitch);
+                                break;
+                            case 0x21:
+                                JPEGPutMCU21(pJPEG, xoff, iPitch);
+                                break;
+                            case 0x22:
+                                JPEGPutMCU22(pJPEG, xoff, iPitch);
+                                break;
+                        } // switch on color option
+                    } // normal MCU drawing
+                }
                 xoff += mcuCX;
             } // if not skipped
             if (pJPEG->pFramebuffer == NULL && (xoff == iPitch || x == cx-1) && !iSkipMask) // time to draw
