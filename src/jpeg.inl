@@ -21,6 +21,7 @@
 //===========================================================================
 //
 #include "JPEGDEC.h"
+#include <math.h> // cosf/floorf for the floating-point reference IDCT
 
 #ifdef TEENSYDUINO
 #include "my_cm4_simd.h"
@@ -2297,6 +2298,321 @@ mcu_done:
 //
 // Inverse DCT
 //
+//
+// Selectable IDCT precision tiers
+//
+// The default tier (JPEG_IDCT_DEFAULT) is the original built-in IDCT and its
+// output is bit-exact with previous releases. Two integer fixed-point tiers
+// and a floating-point reference tier can be selected at runtime through
+// JPEGIDCTSetMode():
+//   JPEG_IDCT_FAST     - 8-bit fractional constants; skips unpopulated
+//                        columns and half-empty rows (fastest, least accurate)
+//   JPEG_IDCT_ACCURATE - 13-bit fractional constants; full 8x8 two-pass
+//                        (slower, closest integer match to the reference)
+//   JPEG_IDCT_FLOAT    - floating-point reference implementation
+// All tiers saturate their output to the 0..255 range.
+// Note: the JPEG_SCALE_QUARTER shortcut always uses the original code path.
+//
+#define JPEG_IDCT_DEFAULT   0
+#define JPEG_IDCT_FAST      1
+#define JPEG_IDCT_ACCURATE  2
+#define JPEG_IDCT_FLOAT     3
+#define JPEG_IDCT_MODE_MAX  JPEG_IDCT_FLOAT
+
+static int s_iIDCTMode = JPEG_IDCT_DEFAULT;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+// Select the IDCT precision tier. Returns 0 on success and -1 if the
+// requested tier is invalid (the current tier is left unchanged).
+int JPEGIDCTSetMode(int iMode)
+{
+    if (iMode < JPEG_IDCT_DEFAULT || iMode > JPEG_IDCT_MODE_MAX)
+        return -1; // invalid precision tier
+    s_iIDCTMode = iMode;
+    return 0;
+} /* JPEGIDCTSetMode() */
+// Return the currently selected IDCT precision tier
+int JPEGIDCTGetMode(void)
+{
+    return s_iIDCTMode;
+} /* JPEGIDCTGetMode() */
+#ifdef __cplusplus
+}
+#endif
+
+// Fixed-point IDCT constants for the AA&N factorization used by this
+// library (the quantization tables are pre-scaled by JPEGFixQuantD() to
+// match), scaled by 2^13 (accurate tier) and 2^8 (fast tier)
+static const int16_t sIDCTConsts[2][5] = {
+// sqrt(2)-1, sqrt(2), 1.847759065, -2.6131259, 1.08239
+    {3395, 11585, 15137, -21407, 8867},  // Q13
+    { 106,   362,   473,   -669,  277}   // Q8
+};
+// descale with round-to-nearest (relies on arithmetic right shift)
+#define IDCT_DESCALE(x, n) (((x) + (1 << ((n)-1))) >> (n))
+
+// dequantize one coefficient (quant tables are pre-scaled for AA&N);
+// clamped to 16 bits so the fixed-point math below can never overflow
+// (legal 8-bit streams stay within +/-15760 anyway)
+static int32_t JPEGIDCTDequant(int16_t iCoef, int16_t iQuant)
+{
+    int32_t d = (int32_t)iCoef * iQuant;
+    if (d > 32767) d = 32767;
+    else if (d < -32768) d = -32768;
+    return d;
+} /* JPEGIDCTDequant() */
+
+// saturate the final (descaled) value to the 0..255 output range
+static uint8_t JPEGIDCTClamp(int32_t v)
+{
+    v += 128;
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8_t)v;
+} /* JPEGIDCTClamp() */
+
+//
+// Integer fixed-point IDCT using the same AA&N factorization as the
+// original code. bFast != 0 selects the fast tier (Q8 constants, skips
+// unpopulated columns and half-empty rows), bFast == 0 selects the
+// accurate tier (Q13 constants, full 8x8, 2 extra fractional bits
+// carried between the two passes).
+//
+static void JPEGIDCTFixed(JPEGIMAGE *pJPEG, int iMCUOffset, int iQuantTable, int bFast)
+{
+    int32_t i32WS[DCTSIZE]; // intermediate workspace (column pass output)
+    int32_t d0, d1, d2, d3, d4, d5, d6, d7;
+    int32_t tmp0, tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7;
+    int32_t tmp10, tmp11, tmp12, tmp13;
+    int32_t z5, z10, z11, z12, z13;
+    int i, iCol, iRow;
+    uint16_t u16MCUFlags = pJPEG->u16MCUFlags;
+    const int16_t *pC = sIDCTConsts[bFast ? 1 : 0];
+    const int iCBits = bFast ? 8 : 13;
+    const int iP1 = bFast ? 0 : 2; // fractional bits kept after pass 1
+    int16_t *pMCUSrc = &pJPEG->sMCUs[iMCUOffset];
+    signed short *pQuant = &pJPEG->sQuantTable[iQuantTable * DCTSIZE];
+    uint8_t *pOutput;
+
+    // Pass 1: process columns, store into the work array
+    u16MCUFlags |= 1; // column 0 must always be calculated (DC sets no flag)
+    for (iCol = 0; iCol < 8; iCol++)
+    {
+        if (bFast && !(u16MCUFlags & (1 << iCol))) // fast tier: skip unpopulated columns
+        {
+            for (i = iCol; i < DCTSIZE; i += 8)
+                i32WS[i] = 0;
+            continue;
+        }
+        d0 = JPEGIDCTDequant(pMCUSrc[iCol],    pQuant[iCol]);
+        d1 = JPEGIDCTDequant(pMCUSrc[iCol+8],  pQuant[iCol+8]);
+        d2 = JPEGIDCTDequant(pMCUSrc[iCol+16], pQuant[iCol+16]);
+        d3 = JPEGIDCTDequant(pMCUSrc[iCol+24], pQuant[iCol+24]);
+        d4 = JPEGIDCTDequant(pMCUSrc[iCol+32], pQuant[iCol+32]);
+        d5 = JPEGIDCTDequant(pMCUSrc[iCol+40], pQuant[iCol+40]);
+        d6 = JPEGIDCTDequant(pMCUSrc[iCol+48], pQuant[iCol+48]);
+        d7 = JPEGIDCTDequant(pMCUSrc[iCol+56], pQuant[iCol+56]);
+        // even part
+        tmp10 = d0 + d4;
+        tmp11 = d0 - d4;
+        tmp13 = d2 + d6;
+        tmp12 = IDCT_DESCALE((d2 - d6) * pC[1], iCBits) - tmp13; // * sqrt(2)
+        tmp0 = tmp10 + tmp13;
+        tmp3 = tmp10 - tmp13;
+        tmp1 = tmp11 + tmp12;
+        tmp2 = tmp11 - tmp12;
+        // odd part
+        z13 = d5 + d3;
+        z10 = d5 - d3;
+        z11 = d1 + d7;
+        z12 = d1 - d7;
+        tmp7 = z11 + z13;
+        tmp11 = IDCT_DESCALE((z11 - z13) * pC[1], iCBits); // * sqrt(2)
+        z5 = IDCT_DESCALE((z10 + z12) * pC[2], iCBits);    // * 1.847759065
+        tmp12 = IDCT_DESCALE(z10 * pC[3], iCBits) + z5;    // * -2.6131259
+        tmp6 = tmp12 - tmp7;
+        tmp5 = tmp11 - tmp6;
+        tmp10 = IDCT_DESCALE(z12 * pC[4], iCBits) - z5;    // * 1.08239
+        tmp4 = tmp10 + tmp5;
+        i32WS[iCol]    = (tmp0 + tmp7) << iP1; // row 0
+        i32WS[iCol+56] = (tmp0 - tmp7) << iP1; // row 7
+        i32WS[iCol+8]  = (tmp1 + tmp6) << iP1; // row 1
+        i32WS[iCol+48] = (tmp1 - tmp6) << iP1; // row 6
+        i32WS[iCol+16] = (tmp2 + tmp5) << iP1; // row 2
+        i32WS[iCol+40] = (tmp2 - tmp5) << iP1; // row 5
+        i32WS[iCol+24] = (tmp3 - tmp4) << iP1; // row 3
+        i32WS[iCol+32] = (tmp3 + tmp4) << iP1; // row 4
+    }
+    // Pass 2: process rows from the workspace, saturate output to 0..255
+    pOutput = (uint8_t *)pMCUSrc; // store output pixels back into the MCU
+    for (iRow = 0; iRow < DCTSIZE; iRow += 8)
+    {
+        d0 = i32WS[iRow];   d1 = i32WS[iRow+1]; d2 = i32WS[iRow+2]; d3 = i32WS[iRow+3];
+        d4 = i32WS[iRow+4]; d5 = i32WS[iRow+5]; d6 = i32WS[iRow+6]; d7 = i32WS[iRow+7];
+        if (bFast && (u16MCUFlags & 0xf0) == 0)
+        {
+            // fast tier: right half of the row is all zeros (columns 4-7
+            // were unpopulated), use the simplified half-size calculation
+            tmp10 = tmp11 = d0;
+            tmp13 = d2;
+            tmp12 = IDCT_DESCALE(d2 * pC[0], iCBits); // * (sqrt(2)-1)
+            tmp0 = tmp10 + tmp13;
+            tmp3 = tmp10 - tmp13;
+            tmp1 = tmp11 + tmp12;
+            tmp2 = tmp11 - tmp12;
+            // odd part (d5 = d7 = 0)
+            tmp7 = d1 + d3;
+            tmp11 = IDCT_DESCALE((d1 - d3) * pC[1], iCBits);
+            z5 = IDCT_DESCALE((d1 - d3) * pC[2], iCBits);
+            tmp12 = z5 - IDCT_DESCALE(d3 * pC[3], iCBits);
+            tmp6 = tmp12 - tmp7;
+            tmp5 = tmp11 - tmp6;
+            tmp10 = IDCT_DESCALE(d1 * pC[4], iCBits) - z5;
+            tmp4 = tmp10 + tmp5;
+        }
+        else
+        {
+            // even part
+            tmp10 = d0 + d4;
+            tmp11 = d0 - d4;
+            tmp13 = d2 + d6;
+            tmp12 = IDCT_DESCALE((d2 - d6) * pC[1], iCBits) - tmp13;
+            tmp0 = tmp10 + tmp13;
+            tmp3 = tmp10 - tmp13;
+            tmp1 = tmp11 + tmp12;
+            tmp2 = tmp11 - tmp12;
+            // odd part
+            z13 = d5 + d3;
+            z10 = d5 - d3;
+            z11 = d1 + d7;
+            z12 = d1 - d7;
+            tmp7 = z11 + z13;
+            tmp11 = IDCT_DESCALE((z11 - z13) * pC[1], iCBits);
+            z5 = IDCT_DESCALE((z10 + z12) * pC[2], iCBits);
+            tmp12 = IDCT_DESCALE(z10 * pC[3], iCBits) + z5;
+            tmp6 = tmp12 - tmp7;
+            tmp5 = tmp11 - tmp6;
+            tmp10 = IDCT_DESCALE(z12 * pC[4], iCBits) - z5;
+            tmp4 = tmp10 + tmp5;
+        }
+        // final output stage: apply the 1/32 AA&N scale factor (plus the
+        // extra fractional bits of the accurate tier) and saturate
+        pOutput[iRow+0] = JPEGIDCTClamp(IDCT_DESCALE(tmp0 + tmp7, iP1 + 5));
+        pOutput[iRow+7] = JPEGIDCTClamp(IDCT_DESCALE(tmp0 - tmp7, iP1 + 5));
+        pOutput[iRow+1] = JPEGIDCTClamp(IDCT_DESCALE(tmp1 + tmp6, iP1 + 5));
+        pOutput[iRow+6] = JPEGIDCTClamp(IDCT_DESCALE(tmp1 - tmp6, iP1 + 5));
+        pOutput[iRow+2] = JPEGIDCTClamp(IDCT_DESCALE(tmp2 + tmp5, iP1 + 5));
+        pOutput[iRow+5] = JPEGIDCTClamp(IDCT_DESCALE(tmp2 - tmp5, iP1 + 5));
+        pOutput[iRow+3] = JPEGIDCTClamp(IDCT_DESCALE(tmp3 - tmp4, iP1 + 5));
+        pOutput[iRow+4] = JPEGIDCTClamp(IDCT_DESCALE(tmp3 + tmp4, iP1 + 5));
+    }
+} /* JPEGIDCTFixed() */
+
+//
+// Floating-point reference IDCT: the same AA&N factorization as the
+// original code (matching the pre-scaled quantization tables), computed
+// in single precision. This is the accuracy reference for the integer
+// tiers; it is not optimized for speed.
+//
+static void JPEGIDCTFloat(JPEGIMAGE *pJPEG, int iMCUOffset, int iQuantTable)
+{
+    float fWS[DCTSIZE];
+    float d0, d1, d2, d3, d4, d5, d6, d7;
+    float tmp0, tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7;
+    float tmp10, tmp11, tmp12, tmp13;
+    float z5, z10, z11, z12, z13;
+    int iCol, iRow, iv;
+    int16_t *pMCUSrc = &pJPEG->sMCUs[iMCUOffset];
+    signed short *pQuant = &pJPEG->sQuantTable[iQuantTable * DCTSIZE];
+    uint8_t *pOutput = (uint8_t *)pMCUSrc; // store output pixels back into the MCU
+
+    // pass 1: columns
+    for (iCol = 0; iCol < 8; iCol++)
+    {
+        d0 = (float)(pMCUSrc[iCol]    * pQuant[iCol]);
+        d1 = (float)(pMCUSrc[iCol+8]  * pQuant[iCol+8]);
+        d2 = (float)(pMCUSrc[iCol+16] * pQuant[iCol+16]);
+        d3 = (float)(pMCUSrc[iCol+24] * pQuant[iCol+24]);
+        d4 = (float)(pMCUSrc[iCol+32] * pQuant[iCol+32]);
+        d5 = (float)(pMCUSrc[iCol+40] * pQuant[iCol+40]);
+        d6 = (float)(pMCUSrc[iCol+48] * pQuant[iCol+48]);
+        d7 = (float)(pMCUSrc[iCol+56] * pQuant[iCol+56]);
+        // even part
+        tmp10 = d0 + d4;
+        tmp11 = d0 - d4;
+        tmp13 = d2 + d6;
+        tmp12 = (d2 - d6) * 1.414213562f - tmp13; // * sqrt(2)
+        tmp0 = tmp10 + tmp13;
+        tmp3 = tmp10 - tmp13;
+        tmp1 = tmp11 + tmp12;
+        tmp2 = tmp11 - tmp12;
+        // odd part
+        z13 = d5 + d3;
+        z10 = d5 - d3;
+        z11 = d1 + d7;
+        z12 = d1 - d7;
+        tmp7 = z11 + z13;
+        tmp11 = (z11 - z13) * 1.414213562f;
+        z5 = (z10 + z12) * 1.847759065f;
+        tmp12 = z10 * -2.6131259f + z5;
+        tmp6 = tmp12 - tmp7;
+        tmp5 = tmp11 - tmp6;
+        tmp10 = z12 * 1.08239f - z5;
+        tmp4 = tmp10 + tmp5;
+        fWS[iCol]    = tmp0 + tmp7; // row 0
+        fWS[iCol+56] = tmp0 - tmp7; // row 7
+        fWS[iCol+8]  = tmp1 + tmp6; // row 1
+        fWS[iCol+48] = tmp1 - tmp6; // row 6
+        fWS[iCol+16] = tmp2 + tmp5; // row 2
+        fWS[iCol+40] = tmp2 - tmp5; // row 5
+        fWS[iCol+24] = tmp3 - tmp4; // row 3
+        fWS[iCol+32] = tmp3 + tmp4; // row 4
+    }
+    // pass 2: rows, apply the 1/32 AA&N scale factor, then round,
+    // offset by 128 and saturate to 0..255
+    for (iRow = 0; iRow < DCTSIZE; iRow += 8)
+    {
+        d0 = fWS[iRow];   d1 = fWS[iRow+1]; d2 = fWS[iRow+2]; d3 = fWS[iRow+3];
+        d4 = fWS[iRow+4]; d5 = fWS[iRow+5]; d6 = fWS[iRow+6]; d7 = fWS[iRow+7];
+        // even part
+        tmp10 = d0 + d4;
+        tmp11 = d0 - d4;
+        tmp13 = d2 + d6;
+        tmp12 = (d2 - d6) * 1.414213562f - tmp13;
+        tmp0 = tmp10 + tmp13;
+        tmp3 = tmp10 - tmp13;
+        tmp1 = tmp11 + tmp12;
+        tmp2 = tmp11 - tmp12;
+        // odd part
+        z13 = d5 + d3;
+        z10 = d5 - d3;
+        z11 = d1 + d7;
+        z12 = d1 - d7;
+        tmp7 = z11 + z13;
+        tmp11 = (z11 - z13) * 1.414213562f;
+        z5 = (z10 + z12) * 1.847759065f;
+        tmp12 = z10 * -2.6131259f + z5;
+        tmp6 = tmp12 - tmp7;
+        tmp5 = tmp11 - tmp6;
+        tmp10 = z12 * 1.08239f - z5;
+        tmp4 = tmp10 + tmp5;
+        #define IDCT_FLOAT_OUT(idx, val) \
+            iv = (int)floorf((val) * 0.03125f + 128.0f + 0.5f); \
+            pOutput[iRow+(idx)] = (uint8_t)(iv < 0 ? 0 : (iv > 255 ? 255 : iv))
+        IDCT_FLOAT_OUT(0, tmp0 + tmp7);
+        IDCT_FLOAT_OUT(7, tmp0 - tmp7);
+        IDCT_FLOAT_OUT(1, tmp1 + tmp6);
+        IDCT_FLOAT_OUT(6, tmp1 - tmp6);
+        IDCT_FLOAT_OUT(2, tmp2 + tmp5);
+        IDCT_FLOAT_OUT(5, tmp2 - tmp5);
+        IDCT_FLOAT_OUT(3, tmp3 - tmp4);
+        IDCT_FLOAT_OUT(4, tmp3 + tmp4);
+        #undef IDCT_FLOAT_OUT
+    }
+} /* JPEGIDCTFloat() */
+
 static void JPEGIDCT(JPEGIMAGE *pJPEG, int iMCUOffset, int iQuantTable)
 {
     int iRow;
@@ -2344,6 +2660,14 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
         /* Row 1 */
         pOutput[2] = ucRangeTable[(((tmp2 + tmp3)>>5) & 0x3ff)];
         pOutput[3] = ucRangeTable[(((tmp2 - tmp3)>>5) & 0x3ff)];
+        return;
+    }
+    if (s_iIDCTMode != JPEG_IDCT_DEFAULT) // a specific precision tier was selected
+    {
+        if (s_iIDCTMode == JPEG_IDCT_FLOAT)
+            JPEGIDCTFloat(pJPEG, iMCUOffset, iQuantTable);
+        else
+            JPEGIDCTFixed(pJPEG, iMCUOffset, iQuantTable, (s_iIDCTMode == JPEG_IDCT_FAST));
         return;
     }
 #ifdef HAS_SSE // SSE2 version
