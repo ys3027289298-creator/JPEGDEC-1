@@ -271,3 +271,223 @@ int JPEGDEC::decodeDither(uint8_t *pDither, int iOptions)
     _jpeg.pDitherBuffer = pDither;
     return DecodeJPEG(&_jpeg);
 }
+
+//===========================================================================
+// Optional 3-stage post-processing pipeline for low-bitrate images
+// ----------------------------------------------------------------
+// This code is completely separate from the decode path: it operates on a
+// finished RGB8888 framebuffer (e.g. one filled by decode() together with
+// setFramebuffer()) and never runs unless explicitly called. Each of the
+// three stages can be toggled independently through the iFlags bit mask:
+//   JPEG_PP_DEBLOCK - stage 1: block-boundary deblocking filter
+//   JPEG_PP_CHROMA  - stage 2: chroma bilinear up-sampling (smooths the
+//                     blocky nearest-neighbor 4:2:0 chroma)
+//   JPEG_PP_SHARPEN - stage 3: mild luma sharpening (unsharp mask)
+// The stages run in the order listed above when several are enabled.
+// Returns JPEG_SUCCESS on success, JPEG_INVALID_PARAMETER for bad
+// arguments, JPEG_UNSUPPORTED_FEATURE for an unsupported pixel type and
+// JPEG_ERROR_MEMORY if a work buffer cannot be allocated.
+//
+#define JPEG_PP_DEBLOCK  0x1
+#define JPEG_PP_CHROMA   0x2
+#define JPEG_PP_SHARPEN  0x4
+#define JPEG_PP_ALL      (JPEG_PP_DEBLOCK | JPEG_PP_CHROMA | JPEG_PP_SHARPEN)
+
+// clamp an int to the 0..255 sample range
+static uint8_t PP_Clamp8(int i)
+{
+    if (i < 0) return 0;
+    if (i > 255) return 255;
+    return (uint8_t)i;
+} /* PP_Clamp8() */
+
+//
+// Stage 1: deblocking filter on the 8x8 DCT block grid.
+// For each pair of pixels straddling a block boundary, if the step across
+// the boundary is moderate and dominates the gradient on both sides (a
+// blocking artifact, not a true edge), soften it with a 4-tap filter.
+//
+static void PP_Deblock(uint8_t *pFrame, int iWidth, int iHeight)
+{
+int x, y, c, iPitch = iWidth * 4;
+uint8_t *p1, *p0, *q0, *q1;
+int d0, d1, d2;
+
+    for (x = 8; x + 1 < iWidth; x += 8) // vertical block boundaries
+    {
+        for (y = 0; y < iHeight; y++)
+        {
+            p1 = &pFrame[y * iPitch + (x-2)*4];
+            p0 = p1 + 4; q0 = p0 + 4; q1 = q0 + 4;
+            for (c = 0; c < 3; c++) // R,G,B (alpha is left alone)
+            {
+                d0 = abs(p0[c] - q0[c]); // step across the boundary
+                d1 = abs(p1[c] - p0[c]); // gradient on the near side
+                d2 = abs(q1[c] - q0[c]); // gradient on the far side
+                if (d0 >= 4 && d0 < 40 && d0 > d1 + d2) // blocking artifact
+                {
+                    int n0 = (p1[c] + 2*p0[c] + q0[c] + 2) >> 2;
+                    int n1 = (p0[c] + 2*q0[c] + q1[c] + 2) >> 2;
+                    p0[c] = (uint8_t)n0; q0[c] = (uint8_t)n1;
+                }
+            }
+        }
+    }
+    for (y = 8; y + 1 < iHeight; y += 8) // horizontal block boundaries
+    {
+        for (x = 0; x < iWidth; x++)
+        {
+            p1 = &pFrame[(y-2) * iPitch + x*4];
+            p0 = p1 + iPitch; q0 = p0 + iPitch; q1 = q0 + iPitch;
+            for (c = 0; c < 3; c++)
+            {
+                d0 = abs(p0[c] - q0[c]);
+                d1 = abs(p1[c] - p0[c]);
+                d2 = abs(q1[c] - q0[c]);
+                if (d0 >= 4 && d0 < 40 && d0 > d1 + d2)
+                {
+                    int n0 = (p1[c] + 2*p0[c] + q0[c] + 2) >> 2;
+                    int n1 = (p0[c] + 2*q0[c] + q1[c] + 2) >> 2;
+                    p0[c] = (uint8_t)n0; q0[c] = (uint8_t)n1;
+                }
+            }
+        }
+    }
+} /* PP_Deblock() */
+
+//
+// Stage 2: chroma bilinear up-sampling.
+// Recovers the half-resolution (4:2:0) Cb/Cr planes by averaging each 2x2
+// block, up-samples them back to full resolution with bilinear
+// interpolation and re-applies only the chroma difference to the pixels,
+// so the luma channel passes through untouched.
+//
+static int PP_ChromaBilinear(uint8_t *pFrame, int iWidth, int iHeight)
+{
+int i, j, x, y, dx, dy;
+int iHW = iWidth >> 1, iHH = iHeight >> 1;
+uint8_t *pCb, *pCr, *p;
+int cb, cr, R, G, B;
+
+    pCb = (uint8_t *)malloc(iHW * iHH * 2); // both half-res chroma planes
+    if (pCb == NULL)
+        return JPEG_ERROR_MEMORY;
+    pCr = pCb + iHW * iHH;
+    // recover the half-res chroma; coefficients are 512x the JPEG RGB->YCbCr
+    // values, so the sums below are 2048x the average (Cb-128)/(Cr-128)
+    for (j = 0; j < iHH; j++)
+    {
+        for (i = 0; i < iHW; i++)
+        {
+            cb = cr = 0;
+            for (dy = 0; dy < 2; dy++)
+            {
+                for (dx = 0; dx < 2; dx++)
+                {
+                    p = &pFrame[((j*2+dy) * iWidth + i*2+dx) * 4];
+                    R = p[0]; G = p[1]; B = p[2];
+                    cb += -87*R - 169*G + 256*B;
+                    cr +=  256*R - 214*G - 42*B;
+                }
+            }
+            pCb[j*iHW+i] = PP_Clamp8(128 + ((cb + 1024) >> 11));
+            pCr[j*iHW+i] = PP_Clamp8(128 + ((cr + 1024) >> 11));
+        }
+    }
+    // Half-res sample i is centered at full-res position 2i+0.5; interpolate
+    // bilinearly between the 4 nearest half-res samples (weights sum to 16).
+    for (y = 0; y < iHeight; y++)
+    {
+        int y0 = (2*y - 1) >> 2, fy = (2*y - 1) & 3, y1;
+        if (y0 < 0) { y0 = 0; fy = 0; }
+        y1 = (y0 + 1 < iHH) ? y0 + 1 : iHH - 1;
+        for (x = 0; x < iWidth; x++)
+        {
+            int x0 = (2*x - 1) >> 2, fx = (2*x - 1) & 3, x1;
+            int cbNew, crNew, cbOld, crOld, dCb, dCr;
+            if (x0 < 0) { x0 = 0; fx = 0; }
+            x1 = (x0 + 1 < iHW) ? x0 + 1 : iHW - 1;
+            cbNew = ((4-fy)*((4-fx)*pCb[y0*iHW+x0] + fx*pCb[y0*iHW+x1])
+                        + fy*((4-fx)*pCb[y1*iHW+x0] + fx*pCb[y1*iHW+x1]) + 8) >> 4;
+            crNew = ((4-fy)*((4-fx)*pCr[y0*iHW+x0] + fx*pCr[y0*iHW+x1])
+                        + fy*((4-fx)*pCr[y1*iHW+x0] + fx*pCr[y1*iHW+x1]) + 8) >> 4;
+            p = &pFrame[(y * iWidth + x) * 4];
+            R = p[0]; G = p[1]; B = p[2];
+            cbOld = 128 + ((-87*R - 169*G + 256*B + 256) >> 9);
+            crOld = 128 + ((256*R - 214*G - 42*B + 256) >> 9);
+            dCb = cbNew - cbOld; dCr = crNew - crOld;
+            // apply only the chroma delta (256x the YCbCr->RGB coefficients)
+            p[0] = PP_Clamp8(R + ((359*dCr + 128) >> 8));
+            p[1] = PP_Clamp8(G + ((-88*dCb - 183*dCr + 128) >> 8));
+            p[2] = PP_Clamp8(B + ((454*dCb + 128) >> 8));
+        }
+    }
+    free(pCb);
+    return JPEG_SUCCESS;
+} /* PP_ChromaBilinear() */
+
+//
+// Stage 3: mild luma sharpening (unsharp mask).
+// Adds a fraction of (luma - 3x3 binomial blur of luma) back to each pixel;
+// the same delta is added to R, G and B so the chroma is not affected.
+//
+static int PP_SharpenLuma(uint8_t *pFrame, int iWidth, int iHeight)
+{
+int x, y, i, iBlur, iDelta;
+uint8_t *pY, *p;
+
+    pY = (uint8_t *)malloc(iWidth * iHeight);
+    if (pY == NULL)
+        return JPEG_ERROR_MEMORY;
+    for (i = 0; i < iWidth * iHeight; i++) // 256x the JPEG luma coefficients
+    {
+        p = &pFrame[i*4];
+        pY[i] = (uint8_t)((77*p[0] + 150*p[1] + 29*p[2] + 128) >> 8);
+    }
+    for (y = 1; y < iHeight-1; y++) // border pixels are left unchanged
+    {
+        for (x = 1; x < iWidth-1; x++)
+        {
+            i = y * iWidth + x;
+            iBlur = (pY[i-iWidth-1] + 2*pY[i-iWidth] + pY[i-iWidth+1]
+                   + 2*pY[i-1]        + 4*pY[i]        + 2*pY[i+1]
+                   + pY[i+iWidth-1] + 2*pY[i+iWidth] + pY[i+iWidth+1] + 8) >> 4;
+            iDelta = (pY[i] - iBlur) / 4; // mild: 25% unsharp mask
+            if (iDelta > 24) iDelta = 24; // limit overshoot on strong edges
+            else if (iDelta < -24) iDelta = -24;
+            if (iDelta)
+            {
+                p = &pFrame[i*4];
+                p[0] = PP_Clamp8(p[0] + iDelta);
+                p[1] = PP_Clamp8(p[1] + iDelta);
+                p[2] = PP_Clamp8(p[2] + iDelta);
+            }
+        }
+    }
+    free(pY);
+    return JPEG_SUCCESS;
+} /* PP_SharpenLuma() */
+
+//
+// Public entry point: run the enabled post-processing stages in place on an
+// RGB8888 framebuffer. All parameters are validated before the image is
+// touched; an invalid parameter leaves the buffer unchanged.
+//
+int JPEG_PostProcess(uint8_t *pFrame, int iWidth, int iHeight, int iPixelType, int iFlags)
+{
+int iErr = JPEG_SUCCESS;
+
+    if (pFrame == NULL || iWidth <= 0 || iHeight <= 0 || (iFlags & ~JPEG_PP_ALL) != 0)
+        return JPEG_INVALID_PARAMETER;
+    if (iPixelType != RGB8888)
+        return JPEG_UNSUPPORTED_FEATURE;
+    if ((iFlags & JPEG_PP_CHROMA) && ((iWidth & 1) || (iHeight & 1)))
+        return JPEG_INVALID_PARAMETER; // the 4:2:0 chroma stage needs even dimensions
+    if (iFlags & JPEG_PP_DEBLOCK)
+        PP_Deblock(pFrame, iWidth, iHeight);
+    if ((iFlags & JPEG_PP_CHROMA) && iErr == JPEG_SUCCESS)
+        iErr = PP_ChromaBilinear(pFrame, iWidth, iHeight);
+    if ((iFlags & JPEG_PP_SHARPEN) && iErr == JPEG_SUCCESS)
+        iErr = PP_SharpenLuma(pFrame, iWidth, iHeight);
+    return iErr;
+} /* JPEG_PostProcess() */
