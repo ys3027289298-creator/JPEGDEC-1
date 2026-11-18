@@ -73,6 +73,9 @@ static int JPEGInit(JPEGIMAGE *pJPEG);
 static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb);
 static void JPEGGetMoreData(JPEGIMAGE *pPage);
 static int DecodeJPEG(JPEGIMAGE *pImage);
+#if defined (__MACH__) || defined( __LINUX__ )
+static int JPEGDecodeParallel(JPEGIMAGE *pJPEG); // restart-marker segmented decode (host threads)
+#endif
 static int32_t readRAM(JPEGFILE *pFile, uint8_t *pBuf, int32_t iLen);
 static int32_t seekMem(JPEGFILE *pFile, int32_t iPosition);
 #if defined (__MACH__) || defined( __LINUX__ ) || defined( __MCUXPRESSO ) || defined(_WIN64)
@@ -5036,6 +5039,18 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     JPEGDRAW jd;
     int iMaxFill = 16, iScaleShift = 0;
 
+#if defined (__MACH__) || defined( __LINUX__ )
+    //
+    // Restart-marker segmented parallel decode.
+    // If the image cannot be handled in parallel for any reason, this
+    // returns 0 and we fall through to the unchanged serial path below,
+    // so serial output is guaranteed pixel-for-pixel identical.
+    //
+    if (JPEGDecodeParallel(pJPEG))
+        return 1;
+    pJPEG->iError = JPEG_SUCCESS; // a failed parallel attempt must not poison the serial run
+#endif
+
     // Requested the Exif thumbnail
     if (pJPEG->ucMode == 0xc2) { // progressive mode - we only decode the first scan (DC values)
         pJPEG->iOptions |= JPEG_SCALE_EIGHTH; // return 1/8 sized image
@@ -5431,3 +5446,930 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
         pJPEG->iError = JPEG_DECODE_ERROR;
     return (iErr == 0);
 } /* DecodeJPEG() */
+
+//===========================================================================
+//
+// Restart-marker segmented parallel decode (host builds only: Linux/macOS)
+//
+// A baseline JPEG carrying a DRI restart interval can be split into
+// independent entropy segments at RSTn markers. Every segment starts on a
+// byte boundary with the DC predictors reset to 0, so each one is a fully
+// self-contained decode. Segments are decoded on worker threads and their
+// output blocks are assembled back into the full image in scan order.
+//
+// Any structural problem (no DRI, unknown/corrupt marker in the entropy
+// area, RST sequence mismatch, worker decode/verify failure, ...) makes the
+// caller fall back to the serial path, whose code above is untouched.
+//
+//===========================================================================
+#if defined (__MACH__) || defined( __LINUX__ )
+#include <pthread.h>
+#include <semaphore.h>
+#include <unistd.h>
+
+#define JPEG_PAR_MAX_SEGMENTS 256     // upper bound on accepted RST segments
+#define JPEG_PAR_MAX_THREADS 16       // upper bound on worker thread count
+#define JPEG_PAR_RST_MARKERS 8        // RST0..RST7
+
+// A single restart-bounded entropy segment
+typedef struct jpeg_par_segment_tag
+{
+    int32_t iStart;   // file offset of the first entropy byte of the segment
+    int32_t iEnd;     // file offset just past the last entropy byte (next RST/EOI)
+    int iFirstMCU;    // linear MCU index at which this segment starts
+    int iMCUs;        // MCUs assigned to this segment (after tiny-segment merging)
+    int iThread;      // worker thread that processed it (-1 if serial fallback)
+} JPEG_PAR_SEGMENT;
+
+// Tunable configuration (file-local; configured through the setters below)
+static int s_iParallelEnabled = 1;            // master switch
+static int s_iParallelThreads = 0;            // 0 = auto (core count, capped)
+static int s_iParallelMinSegmentMCUs = 1;     // segments smaller than this get merged
+static int s_iParallelConfigInit = 0;
+
+// Diagnostics from the most recent decode attempt
+static int s_iParallelLastSegments = 0;
+static int s_iParallelLastThreadsUsed = 0;
+static int s_iParallelLastFellBack = 0;
+static int s_iParallelLastReason = 0;
+
+//
+// Persistent worker pool. Threads are created once and reused across decodes
+// (per-decode pthread_create costs ~100 us/thread and dwarfs small images).
+// Two semaphores provide a race-free handshake: the boss posts one "work"
+// token per worker per decode, each worker drains the shared segment queue,
+// then posts one "done" token; the boss waits to collect every done token.
+//
+struct jpeg_par_job_tag; // forward declaration (defined below)
+typedef struct jpeg_par_job_tag JPEG_PAR_JOB;
+typedef struct jpeg_par_pool_tag
+{
+    int iWorkerCount;            // threads currently held
+    int iStarted;                // 1 once initialized
+    pthread_t aThreads[JPEG_PAR_MAX_THREADS];
+    sem_t semWork;               // boss -> workers
+    sem_t semDone;               // workers -> boss
+    pthread_mutex_t mutex;       // guards the segment queue and error latch
+    JPEG_PAR_JOB *pActiveJob;    // job being processed (NULL when idle)
+    int iShutdown;
+} JPEG_PAR_POOL;
+
+static JPEG_PAR_POOL g_jpegPool;
+
+// Fallback reasons reported through JPEG_getParallelStats()
+enum {
+    JPEG_PAR_OK = 0,
+    JPEG_PAR_DISABLED,
+    JPEG_PAR_NOT_RAM,
+    JPEG_PAR_NOT_BASELINE,
+    JPEG_PAR_UNSUPPORTED_OPTIONS,
+    JPEG_PAR_DITHERED_OUTPUT,
+    JPEG_PAR_NO_RESTART_INTERVAL,
+    JPEG_PAR_SCAN_ERROR,        // bad/missing marker or untrusted segmentation
+    JPEG_PAR_BAD_GRID,          // geometry unusable for parallel decode
+    JPEG_PAR_MEMORY,
+    JPEG_PAR_WORKER_FAILED      // a worker hit corrupt entropy data
+};
+
+static void JPEGParallelInitConfig(void)
+{
+    if (s_iParallelConfigInit)
+        return;
+    s_iParallelConfigInit = 1;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) n = 1;
+    if (n > JPEG_PAR_MAX_THREADS) n = JPEG_PAR_MAX_THREADS;
+    s_iParallelThreads = (int)n;
+    // Optional overrides from the environment (no API change needed to tune)
+    const char *p = getenv("JPEGDEC_THREADS");
+    if (p) {
+        int v = atoi(p);
+        if (v >= 1)
+            s_iParallelThreads = (v > JPEG_PAR_MAX_THREADS) ? JPEG_PAR_MAX_THREADS : v;
+    }
+    p = getenv("JPEGDEC_PARALLEL");
+    if (p && (p[0] == '0' || p[0] == 'n' || p[0] == 'N'))
+        s_iParallelEnabled = 0;
+    p = getenv("JPEGDEC_MIN_SEGMENT_MCUS");
+    if (p) {
+        int v = atoi(p);
+        if (v >= 1)
+            s_iParallelMinSegmentMCUs = v;
+    }
+} /* JPEGParallelInitConfig() */
+
+//
+// Per-worker shared context
+//
+struct jpeg_par_job_tag
+{
+    JPEGIMAGE *pParent;            // template image state (header/tables)
+    JPEG_PAR_SEGMENT *pSegments;   // segment table
+    int iSegmentCount;
+    int iNextSegment;              // dynamic work-queue index (guarded by mutex)
+    pthread_mutex_t mutex;         // single shared lock (struct allocated once)
+    int iError;                    // latched first worker failure
+    int iImageMCUsX, iImageMCUsY;  // MCU grid dimensions
+    int iMCUCX, iMCUCY;            // MCU pixel size (already scale-adjusted)
+    int iScaleShift;
+    int iOutWidth, iOutHeight;     // scaled output dimensions
+    int iPixelSize;                // bytes per output pixel (1, 2 or 4)
+    int iRowPitchBytes;            // byte pitch of the output image
+    uint8_t *pOutImage;            // final assembled image (private or user buffer)
+    int bUserFramebuffer;          // pOutImage is the caller's framebuffer
+    int iRowBufferBytes;           // size of each worker's private row scratch
+};
+
+//
+// Decode one restart-bounded segment. Mirrors the MCU loop of DecodeJPEG()
+// exactly (same Huffman/IDCT/color routines, same restart bookkeeping) but
+// stops after the segment's assigned MCU count and writes through the
+// assembler instead of the user draw callback.
+//
+static int JPEGDecodeSegment(JPEGIMAGE *pJPEG, JPEG_PAR_JOB *pJob,
+                             JPEG_PAR_SEGMENT *pSeg, uint8_t *pRowBuf)
+{
+    int cx = pJob->iImageMCUsX;
+    int mcuCX = pJob->iMCUCX, mcuCY = pJob->iMCUCY;
+    int iLum0, iLum1, iLum2, iLum3, iCr, iCb;
+    signed int iDCPred0, iDCPred1, iDCPred2;
+    int i, iQuant1, iQuant2, iQuant3, iErr = 0;
+    uint32_t l, *pl;
+    unsigned char c;
+    int iPitch;
+    unsigned char cDCTable0, cACTable0, cDCTable1, cACTable1, cDCTable2, cACTable2;
+    int iMaxFill = 16;
+    // pRowBuf: caller-provided, worker-private scratch for one full MCU row
+
+    if (pJob->iScaleShift >= 2)
+        iMaxFill = 1;
+
+    cDCTable0 = pJPEG->JPCI[0].dc_tbl_no;
+    cACTable0 = pJPEG->JPCI[0].ac_tbl_no;
+    cDCTable1 = pJPEG->JPCI[1].dc_tbl_no;
+    cACTable1 = pJPEG->JPCI[1].ac_tbl_no;
+    cDCTable2 = pJPEG->JPCI[2].dc_tbl_no;
+    cACTable2 = pJPEG->JPCI[2].ac_tbl_no;
+    iDCPred0 = iDCPred1 = iDCPred2 = 0;
+
+    switch (pJPEG->ucSubSample)
+    {
+        case 0x00:
+        case 0x01:
+        case 0x11:
+            iCr = MCU1; iCb = MCU2;
+            break;
+        case 0x12:
+            iCr = MCU2; iCb = MCU3;
+            break;
+        case 0x21:
+            iCr = MCU2; iCb = MCU3;
+            break;
+        case 0x22:
+            iCr = MCU4; iCb = MCU5;
+            break;
+        default:
+            return -1;
+    }
+    iQuant1 = pJPEG->sQuantTable[pJPEG->JPCI[0].quant_tbl_no*DCTSIZE];
+    iQuant2 = pJPEG->sQuantTable[pJPEG->JPCI[1].quant_tbl_no*DCTSIZE];
+    iQuant3 = pJPEG->sQuantTable[pJPEG->JPCI[2].quant_tbl_no*DCTSIZE];
+    iLum0 = MCU0; iLum1 = MCU1; iLum2 = MCU2; iLum3 = MCU3;
+    pJPEG->iResCount = pJPEG->iResInterval;
+
+    // Each worker renders full-width MCU rows into its own private row
+    // buffer, then publishes the row into the shared canvas. A restart
+    // interval may split an MCU row across two segments, so the publish
+    // step is serialized and only the MCU column range this segment owns
+    // is copied (the other half is published by the neighboring segment).
+    iPitch = pJob->iOutWidth;
+
+    int iTotal = pSeg->iMCUs;
+    int iStartMCU = pSeg->iFirstMCU;
+    for (int n = 0; n < iTotal && iErr == 0; n++)
+    {
+        int x = (iStartMCU + n) % cx;
+        int y = (iStartMCU + n) / cx;
+        // Render into the worker's private full-width row buffer.
+        pJPEG->usPixels = (uint16_t *)pRowBuf;
+
+        pJPEG->ucACTable = cACTable0;
+        pJPEG->ucDCTable = cDCTable0;
+        iErr = JPEGDecodeMCU(pJPEG, iLum0, &iDCPred0);
+        if (pJPEG->u16MCUFlags == 0)
+        {
+            pl = (uint32_t *)&pJPEG->sMCUs[iLum0];
+            c = ucRangeTable[((iDCPred0 * iQuant1) >> 5) & 0x3ff];
+            l = c | ((uint32_t)c << 8) | ((uint32_t)c << 16) | ((uint32_t)c << 24);
+            for (i = 0; i < iMaxFill; i++)
+                pl[i] = l;
+        }
+        else
+        {
+            JPEGIDCT(pJPEG, iLum0, pJPEG->JPCI[0].quant_tbl_no);
+        }
+        if (pJPEG->ucSubSample > 0x11) // subsampled color
+        {
+            iErr |= JPEGDecodeMCU(pJPEG, iLum1, &iDCPred0);
+            if (pJPEG->u16MCUFlags == 0)
+            {
+                pl = (uint32_t *)&pJPEG->sMCUs[iLum1];
+                c = ucRangeTable[((iDCPred0 * iQuant1) >> 5) & 0x3ff];
+                l = c | ((uint32_t)c << 8) | ((uint32_t)c << 16) | ((uint32_t)c << 24);
+                for (i = 0; i < iMaxFill; i++)
+                    pl[i] = l;
+            }
+            else
+            {
+                JPEGIDCT(pJPEG, iLum1, pJPEG->JPCI[0].quant_tbl_no);
+            }
+            if (pJPEG->ucSubSample == 0x22)
+            {
+                iErr |= JPEGDecodeMCU(pJPEG, iLum2, &iDCPred0);
+                if (pJPEG->u16MCUFlags == 0)
+                {
+                    pl = (uint32_t *)&pJPEG->sMCUs[iLum2];
+                    c = ucRangeTable[((iDCPred0 * iQuant1) >> 5) & 0x3ff];
+                    l = c | ((uint32_t)c << 8) | ((uint32_t)c << 16) | ((uint32_t)c << 24);
+                    for (i = 0; i < iMaxFill; i++)
+                        pl[i] = l;
+                }
+                else
+                {
+                    JPEGIDCT(pJPEG, iLum2, pJPEG->JPCI[0].quant_tbl_no);
+                }
+                iErr |= JPEGDecodeMCU(pJPEG, iLum3, &iDCPred0);
+                if (pJPEG->u16MCUFlags == 0)
+                {
+                    pl = (uint32_t *)&pJPEG->sMCUs[iLum3];
+                    c = ucRangeTable[((iDCPred0 * iQuant1) >> 5) & 0x3ff];
+                    l = c | ((uint32_t)c << 8) | ((uint32_t)c << 16) | ((uint32_t)c << 24);
+                    for (i = 0; i < iMaxFill; i++)
+                        pl[i] = l;
+                }
+                else
+                {
+                    JPEGIDCT(pJPEG, iLum3, pJPEG->JPCI[0].quant_tbl_no);
+                }
+            }
+        }
+        if (pJPEG->ucSubSample && pJPEG->ucNumComponents == 3) // color channels
+        {
+            pJPEG->ucACTable = cACTable1;
+            pJPEG->ucDCTable = cDCTable1;
+            if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
+                iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred1);
+                iErr |= JPEGDecodeMCU(pJPEG, MCU_SKIP, &iDCPred2);
+            } else {
+                iErr |= JPEGDecodeMCU(pJPEG, iCr, &iDCPred1);
+                if (pJPEG->u16MCUFlags == 0)
+                {
+                    pl = (uint32_t *)&pJPEG->sMCUs[iCr];
+                    c = ucRangeTable[((iDCPred1 * iQuant2) >> 5) & 0x3ff];
+                    l = c | ((uint32_t)c << 8) | ((uint32_t)c << 16) | ((uint32_t)c << 24);
+                    for (i = 0; i < iMaxFill; i++)
+                        pl[i] = l;
+                }
+                else
+                {
+                    JPEGIDCT(pJPEG, iCr, pJPEG->JPCI[1].quant_tbl_no);
+                }
+                pJPEG->ucACTable = cACTable2;
+                pJPEG->ucDCTable = cDCTable2;
+                iErr |= JPEGDecodeMCU(pJPEG, iCb, &iDCPred2);
+                if (pJPEG->u16MCUFlags == 0)
+                {
+                    pl = (uint32_t *)&pJPEG->sMCUs[iCb];
+                    c = ucRangeTable[((iDCPred2 * iQuant3) >> 5) & 0x3ff];
+                    l = c | ((uint32_t)c << 8) | ((uint32_t)c << 16) | ((uint32_t)c << 24);
+                    for (i = 0; i < iMaxFill; i++)
+                        pl[i] = l;
+                }
+                else
+                {
+                    JPEGIDCT(pJPEG, iCb, pJPEG->JPCI[2].quant_tbl_no);
+                }
+            }
+        }
+        if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
+            JPEGPutMCU8BitGray(pJPEG, x * mcuCX, iPitch);
+        } else {
+            switch (pJPEG->ucSubSample) {
+                case 0x00:
+                    JPEGPutMCUGray(pJPEG, x * mcuCX, iPitch);
+                    break;
+                case 0x11:
+                    JPEGPutMCU11(pJPEG, x * mcuCX, iPitch);
+                    break;
+                case 0x12:
+                    JPEGPutMCU12(pJPEG, x * mcuCX, iPitch);
+                    break;
+                case 0x21:
+                    JPEGPutMCU21(pJPEG, x * mcuCX, iPitch);
+                    break;
+                case 0x22:
+                    JPEGPutMCU22(pJPEG, x * mcuCX, iPitch);
+                    break;
+            }
+        }
+        // Publish when this MCU ends a row or the segment ends here.
+        // A segment's first row may start mid-row (only its first row is
+        // ever partial); every later row it owns starts at column 0.
+        // Copy only the MCU columns this segment wrote so that two
+        // segments sharing a row never overwrite each other's pixels.
+        if (x == cx - 1 || n == iTotal - 1)
+        {
+            int iSrcX = (y == (iStartMCU / cx)) ? (iStartMCU % cx) : 0;
+            int iCopyW = (x - iSrcX + 1) * mcuCX;
+            int iClipW = pJob->iOutWidth - iSrcX * mcuCX;
+            if (iCopyW > iClipW)
+                iCopyW = iClipW;
+            int iCopyH = mcuCY;
+            if (y * mcuCY + iCopyH > pJob->iOutHeight)
+                iCopyH = pJob->iOutHeight - y * mcuCY;
+            if (iCopyW > 0 && iCopyH > 0) {
+                pthread_mutex_lock(&pJob->mutex);
+                uint8_t *pDst = pJob->pOutImage +
+                    (size_t)(y * mcuCY) * pJob->iRowPitchBytes +
+                    (size_t)(iSrcX * mcuCX) * pJob->iPixelSize;
+                uint8_t *pSrc = pRowBuf +
+                    (size_t)(iSrcX * mcuCX) * pJob->iPixelSize;
+                for (int ry = 0; ry < iCopyH; ry++) {
+                    memcpy(pDst, pSrc, (size_t)iCopyW * pJob->iPixelSize);
+                    pSrc += (size_t)iPitch * pJob->iPixelSize;
+                    pDst += pJob->iRowPitchBytes;
+                }
+                pthread_mutex_unlock(&pJob->mutex);
+            }
+        }
+        if (pJPEG->iResInterval)
+        {
+            if (--pJPEG->iResCount == 0)
+            {
+                pJPEG->iResCount = pJPEG->iResInterval;
+                iDCPred0 = iDCPred1 = iDCPred2 = 0; // restart: reset predictors
+                if (pJPEG->bb.ulBitOff & 7)
+                    pJPEG->bb.ulBitOff += (8 - (pJPEG->bb.ulBitOff & 7));
+            }
+        }
+        if (pJPEG->iVLCOff >= FILE_HIGHWATER)
+            JPEGGetMoreData(pJPEG);
+    } // for MCUs in segment
+    return iErr;
+} /* JPEGDecodeSegment() */
+
+//
+// Prepare one worker's private JPEGIMAGE state for its segment and decode it
+//
+// Decode one segment with a fresh private JPEGIMAGE state
+static int JPEGParallelRunSegment(JPEG_PAR_JOB *pJob, JPEG_PAR_SEGMENT *pSeg,
+                                  uint8_t *pRowBuf)
+{
+    JPEGIMAGE jpeg;
+    memcpy(&jpeg, pJob->pParent, sizeof(JPEGIMAGE)); // private copy of all state
+    // The memcpy copies the usPixels/sMCUs pointer *values*, which still
+    // reference the parent's inline arrays. Re-seat them into this
+    // worker's own copies, otherwise every thread would share one IDCT
+    // coefficient buffer and one pixel buffer (a data race).
+    int iAlign = (int)(int64_t)jpeg.usUnalignedPixels & 15;
+    if (iAlign == 0) iAlign = 16;
+    jpeg.usPixels = &jpeg.usUnalignedPixels[(16 - iAlign) >> 1];
+    iAlign = (int)(int64_t)jpeg.sUnalignedMCUs & 15;
+    if (iAlign == 0) iAlign = 16;
+    jpeg.sMCUs = &jpeg.sUnalignedMCUs[(16 - iAlign) >> 1];
+    jpeg.pFramebuffer = NULL;                         // usPixels is set per MCU row
+    jpeg.pDitherBuffer = NULL;                        // dithered output is not parallelized
+    jpeg.pfnRead = readRAM;
+    jpeg.pfnSeek = seekMem;
+    jpeg.JPEGFile.pData = pJob->pParent->JPEGFile.pData;
+    jpeg.JPEGFile.iSize = pJob->pParent->JPEGFile.iSize;
+    jpeg.JPEGFile.fHandle = NULL;
+    jpeg.ucFF = 0;
+    // Re-seed the filtered VLC buffer at this segment's entropy start.
+    // The first filter pass runs in place, exactly like JPEGParseInfo()
+    // does at the start of the scan; JPEGGetMoreData() then treats the
+    // bytes already in ucFileBuf as filtered and appends after them.
+    jpeg.JPEGFile.iPos = pSeg->iStart;
+    int iRead = JPEG_FILE_BUF_SIZE;
+    if (pSeg->iStart + iRead > jpeg.JPEGFile.iSize)
+        iRead = jpeg.JPEGFile.iSize - pSeg->iStart;
+    memcpy(jpeg.ucFileBuf, &jpeg.JPEGFile.pData[pSeg->iStart], iRead);
+    jpeg.JPEGFile.iPos = pSeg->iStart + iRead;
+    int i = JPEGFilter(jpeg.ucFileBuf, jpeg.ucFileBuf, iRead, &jpeg.ucFF);
+    jpeg.iVLCOff = 0;
+    jpeg.iVLCSize = i;
+    JPEGGetMoreData(&jpeg);
+    jpeg.bb.ulBits = MOTOLONG(&jpeg.ucFileBuf[0]);
+    jpeg.bb.pBuf = jpeg.ucFileBuf;
+    jpeg.bb.ulBitOff = 0;
+    JPEGFixQuantD(&jpeg);
+
+    return JPEGDecodeSegment(&jpeg, pJob, pSeg, pRowBuf);
+}
+
+// Persistent worker: blocks on semWork, drains the shared segment queue,
+// then reports completion on semDone. One work token == one decode job.
+static void *JPEGParallelWorker(void *pArg)
+{
+    int iWorker = (int)(intptr_t)pArg;
+    uint8_t *pRowBuf = NULL;
+    int iRowBufSize = 0;
+
+    for (;;) {
+        sem_wait(&g_jpegPool.semWork);
+        if (g_jpegPool.iShutdown) {
+            free(pRowBuf);
+            return NULL;
+        }
+        JPEG_PAR_JOB *pJob = g_jpegPool.pActiveJob;
+        // Grow the private scratch if this job needs a wider row.
+        if (iRowBufSize < pJob->iRowBufferBytes) {
+            free(pRowBuf);
+            pRowBuf = (uint8_t *)malloc(pJob->iRowBufferBytes);
+            iRowBufSize = pRowBuf ? pJob->iRowBufferBytes : 0;
+        }
+        if (!pRowBuf) {
+            pthread_mutex_lock(&g_jpegPool.mutex);
+            if (pJob->iError == 0)
+                pJob->iError = -1;
+            pthread_mutex_unlock(&g_jpegPool.mutex);
+            sem_post(&g_jpegPool.semDone);
+            continue;
+        }
+        for (;;) {
+            int iSeg;
+            pthread_mutex_lock(&g_jpegPool.mutex);
+            if (pJob->iError != 0 || pJob->iNextSegment >= pJob->iSegmentCount) {
+                pthread_mutex_unlock(&g_jpegPool.mutex);
+                break;
+            }
+            iSeg = pJob->iNextSegment++;
+            pJob->pSegments[iSeg].iThread = iWorker;
+            pthread_mutex_unlock(&g_jpegPool.mutex);
+
+            int rc = JPEGParallelRunSegment(pJob, &pJob->pSegments[iSeg], pRowBuf);
+            if (rc != 0) {
+                pthread_mutex_lock(&g_jpegPool.mutex);
+                if (pJob->iError == 0)
+                    pJob->iError = rc;
+                pthread_mutex_unlock(&g_jpegPool.mutex);
+                break;
+            }
+        }
+        sem_post(&g_jpegPool.semDone);
+    }
+} /* JPEGParallelWorker() */
+
+//
+// Scan the raw JPEG memory for the SOS header and the RSTn markers inside
+// the entropy data. Returns 1 and fills the segment table on success;
+// returns 0 on any structural/marker damage (caller falls back to serial).
+//
+static int JPEGScanRestartSegments(JPEGIMAGE *pJPEG, JPEG_PAR_SEGMENT *pSegments,
+                                   int *piSegmentCount, int *piTotalMCUs,
+                                   int *piMCUsX, int *piMCUsY, int *piMCUCX, int *piMCUCY)
+{
+    uint8_t *pData = pJPEG->JPEGFile.pData;
+    int iSize = pJPEG->JPEGFile.iSize;
+    int iOff = 0;
+    int32_t rstPos[JPEG_PAR_MAX_SEGMENTS + 1];
+    int rstSeq[JPEG_PAR_MAX_SEGMENTS + 1];
+    int iRstCount = 0;
+    int iEntropyStart = 0, iEntropyEnd = 0;
+    int iScanHeaderLen = 0;
+
+    if (iSize < 4 || pData[0] != 0xff || pData[1] != 0xd8)
+        return 0;
+    iOff = 2;
+    // Walk the marker segment header up to SOS
+    while (iOff + 4 <= iSize) {
+        if (pData[iOff] != 0xff)
+            return 0; // expected a marker
+        uint8_t ucMarker = pData[iOff + 1];
+        if (ucMarker == 0xd9) // EOI before any scan - nothing to decode
+            return 0;
+        if (ucMarker == 0xda) { // SOS
+            if (iOff + 4 > iSize)
+                return 0;
+            uint16_t uSosLen = (uint16_t)((pData[iOff+2] << 8) | pData[iOff+3]);
+            if (uSosLen < 6 || iOff + 2 + uSosLen > iSize)
+                return 0;
+            iScanHeaderLen = 2 + uSosLen;
+            iEntropyStart = iOff + iScanHeaderLen;
+            break;
+        }
+        if (ucMarker == 0x01 || (ucMarker >= 0xd0 && ucMarker <= 0xd7))
+            return 0; // standalone markers are illegal in the header area
+        // Length-prefixed marker segment
+        if (iOff + 4 > iSize)
+            return 0;
+        uint16_t uLen = (uint16_t)((pData[iOff+2] << 8) | pData[iOff+3]);
+        if (uLen < 2 || iOff + 2 + uLen > iSize)
+            return 0;
+        iOff += 2 + uLen;
+    }
+    if (iEntropyStart == 0)
+        return 0;
+
+    // Walk the entropy stream honoring FF-byte-stuffing (FF 00)
+    iOff = iEntropyStart;
+    while (iOff < iSize) {
+        if (pData[iOff] != 0xff) {
+            iOff++;
+            continue;
+        }
+        // collapse runs of fill FF bytes
+        int j = iOff;
+        while (j < iSize && pData[j] == 0xff)
+            j++;
+        if (j >= iSize) {
+            iOff = j; // trailing fill bytes
+            break;
+        }
+        uint8_t ucNext = pData[j];
+        if (ucNext == 0x00) { // stuffed zero: literal entropy byte
+            iOff = j + 1;
+            continue;
+        }
+        if (ucNext >= 0xd0 && ucNext <= 0xd7) { // RSTn restart marker
+            if (iRstCount >= JPEG_PAR_MAX_SEGMENTS)
+                return 0;
+            rstPos[iRstCount] = iOff;
+            rstSeq[iRstCount] = ucNext - 0xd0;
+            iRstCount++;
+            iOff = j + 1;
+            continue;
+        }
+        if (ucNext == 0xd9) { // EOI: end of entropy
+            iEntropyEnd = iOff;
+            break;
+        }
+        // Any other marker inside entropy data means damage we cannot segment
+        return 0;
+    }
+    if (iEntropyEnd == 0) {
+        // Truncated stream (no EOI): let the serial path handle the error
+        return 0;
+    }
+
+    // MCU geometry (must match DecodeJPEG() exactly)
+    int mcuCX, mcuCY, cx, cy;
+    switch (pJPEG->ucSubSample)
+    {
+        case 0x00:
+        case 0x01:
+        case 0x11:
+            cx = (pJPEG->iWidth + 7) >> 3;
+            cy = (pJPEG->iHeight + 7) >> 3;
+            mcuCX = mcuCY = 8;
+            break;
+        case 0x12:
+            cx = (pJPEG->iWidth + 7) >> 3;
+            cy = (pJPEG->iHeight + 15) >> 4;
+            mcuCX = 8; mcuCY = 16;
+            break;
+        case 0x21:
+            cx = (pJPEG->iWidth + 15) >> 4;
+            cy = (pJPEG->iHeight + 7) >> 3;
+            mcuCX = 16; mcuCY = 8;
+            break;
+        case 0x22:
+            cx = (pJPEG->iWidth + 15) >> 4;
+            cy = (pJPEG->iHeight + 15) >> 4;
+            mcuCX = mcuCY = 16;
+            break;
+        default:
+            return 0;
+    }
+    int iTotalMCUs = cx * cy;
+    int iInterval = pJPEG->iResInterval;
+    if (iInterval <= 0 || iRstCount == 0)
+        return 0;
+    int iExpectedRST = (iTotalMCUs + iInterval - 1) / iInterval - 1;
+    if (iExpectedRST < 0)
+        return 0;
+    if (iRstCount != iExpectedRST)
+        return 0; // missing/extra restart markers: unreliable segmentation
+
+    // Validate RST sequence numbers and map markers to MCU grid positions
+    int iFirstMCUs[JPEG_PAR_MAX_SEGMENTS + 1];
+    for (int k = 0; k < iRstCount; k++) {
+        int iExpectedSeq = k & 7;
+        if (rstSeq[k] != iExpectedSeq) {
+            // Irregular intervals can legitimately offset the mod-8 sequence;
+            // only accept it if the marker lands on a valid interval boundary.
+            if ((iInterval * (k + 1)) > iTotalMCUs)
+                return 0;
+        }
+        iFirstMCUs[k + 1] = iInterval * (k + 1);
+        if (iFirstMCUs[k + 1] >= iTotalMCUs)
+            return 0;
+    }
+
+    // Build the raw segments (entropy byte ranges + first MCU index)
+    int iSeg = 0;
+    int iSegStartMCU = 0;
+    int32_t iSegStartByte = iEntropyStart;
+    for (int k = 0; k < iRstCount; k++) {
+        pSegments[iSeg].iStart = iSegStartByte;
+        pSegments[iSeg].iEnd = rstPos[k];
+        pSegments[iSeg].iFirstMCU = iSegStartMCU;
+        pSegments[iSeg].iMCUs = iFirstMCUs[k + 1] - iSegStartMCU;
+        pSegments[iSeg].iThread = -1;
+        iSeg++;
+        iSegStartByte = rstPos[k] + 2; // skip the 2-byte RST marker
+        iSegStartMCU = iFirstMCUs[k + 1];
+    }
+    // Final segment up to EOI
+    pSegments[iSeg].iStart = iSegStartByte;
+    pSegments[iSeg].iEnd = iEntropyEnd;
+    pSegments[iSeg].iFirstMCU = iSegStartMCU;
+    pSegments[iSeg].iMCUs = iTotalMCUs - iSegStartMCU;
+    pSegments[iSeg].iThread = -1;
+    iSeg++;
+    if (pSegments[iSeg - 1].iMCUs <= 0)
+        return 0;
+
+    // Merge undersized segments into their predecessors (configurable floor)
+    int iMinMCUs = s_iParallelMinSegmentMCUs;
+    if (iMinMCUs > 1) {
+        int w = 0;
+        for (int k = 0; k < iSeg; k++) {
+            if (w > 0 && pSegments[w - 1].iMCUs < iMinMCUs &&
+                pSegments[k].iFirstMCU == pSegments[w - 1].iFirstMCU + pSegments[w - 1].iMCUs) {
+                pSegments[w - 1].iEnd = pSegments[k].iEnd;
+                pSegments[w - 1].iMCUs += pSegments[k].iMCUs;
+                continue;
+            }
+            if (w != k)
+                pSegments[w] = pSegments[k];
+            w++;
+        }
+        iSeg = w;
+    }
+
+    *piSegmentCount = iSeg;
+    *piTotalMCUs = iTotalMCUs;
+    *piMCUsX = cx;
+    *piMCUsY = cy;
+    *piMCUCX = mcuCX;
+    *piMCUCY = mcuCY;
+    return 1;
+} /* JPEGScanRestartSegments() */
+
+//
+// Make sure the persistent pool has at least iWant workers. The pool only
+// ever grows (threads are long-lived), so a smaller request reuses them and
+// the extra workers simply stay blocked on semWork. Returns the worker count
+// actually available, or 0 on failure.
+//
+static int JPEGParallelEnsurePool(int iWant)
+{
+    if (iWant > JPEG_PAR_MAX_THREADS)
+        iWant = JPEG_PAR_MAX_THREADS;
+    if (!g_jpegPool.iStarted) {
+        memset(&g_jpegPool, 0, sizeof(g_jpegPool));
+        if (sem_init(&g_jpegPool.semWork, 0, 0) != 0 ||
+            sem_init(&g_jpegPool.semDone, 0, 0) != 0)
+            return 0;
+        pthread_mutex_init(&g_jpegPool.mutex, NULL);
+        g_jpegPool.iStarted = 1;
+    }
+    while (g_jpegPool.iWorkerCount < iWant) {
+        int idx = g_jpegPool.iWorkerCount;
+        if (pthread_create(&g_jpegPool.aThreads[idx], NULL,
+                           JPEGParallelWorker, (void *)(intptr_t)idx) != 0)
+            break;
+        g_jpegPool.iWorkerCount++;
+    }
+    return g_jpegPool.iWorkerCount;
+}
+
+//
+// Run one prepared job on the pool and wait for completion.
+//
+static int JPEGParallelRunJob(JPEG_PAR_JOB *pJob, int iThreads)
+{
+    int i;
+    pJob->iNextSegment = 0;
+    pJob->iError = 0;
+    g_jpegPool.pActiveJob = pJob;
+    // Wake exactly iThreads workers for this decode.
+    for (i = 0; i < iThreads; i++)
+        sem_post(&g_jpegPool.semWork);
+    for (i = 0; i < iThreads; i++)
+        sem_wait(&g_jpegPool.semDone);
+    g_jpegPool.pActiveJob = NULL;
+    return pJob->iError;
+}
+
+//
+// Parallel entry point. Returns 1 on a successful parallel decode,
+// 0 when the image must be handled by the serial path (any reason).
+//
+static int JPEGDecodeParallel(JPEGIMAGE *pJPEG)
+{
+    JPEGParallelInitConfig();
+    s_iParallelLastSegments = 0;
+    s_iParallelLastThreadsUsed = 0;
+    s_iParallelLastFellBack = 1;
+
+    if (!s_iParallelEnabled) { s_iParallelLastReason = JPEG_PAR_DISABLED; return 0; }
+    if (pJPEG->ucMemType != JPEG_MEM_RAM || pJPEG->JPEGFile.pData == NULL) {
+        s_iParallelLastReason = JPEG_PAR_NOT_RAM; return 0;
+    }
+    if (pJPEG->ucMode != 0xc0) { // baseline DHT JPEGs only
+        s_iParallelLastReason = JPEG_PAR_NOT_BASELINE; return 0;
+    }
+    if (pJPEG->iOptions & (JPEG_AUTO_ROTATE | JPEG_EXIF_THUMBNAIL | JPEG_USES_DMA |
+                           JPEG_SCALE_QUARTER | JPEG_SCALE_EIGHTH)) {
+        s_iParallelLastReason = JPEG_PAR_UNSUPPORTED_OPTIONS; return 0;
+    }
+    if (pJPEG->iCropCX != pJPEG->iWidth || pJPEG->iCropCY != pJPEG->iHeight ||
+        pJPEG->iCropX != 0 || pJPEG->iCropY != 0) {
+        s_iParallelLastReason = JPEG_PAR_UNSUPPORTED_OPTIONS; return 0;
+    }
+    if (pJPEG->ucPixelType > EIGHT_BIT_GRAYSCALE) { // dithered output is stateful
+        s_iParallelLastReason = JPEG_PAR_DITHERED_OUTPUT; return 0;
+    }
+    if (pJPEG->iResInterval <= 0) {
+        s_iParallelLastReason = JPEG_PAR_NO_RESTART_INTERVAL; return 0;
+    }
+
+    JPEG_PAR_SEGMENT *pSegments = (JPEG_PAR_SEGMENT *)
+        malloc(sizeof(JPEG_PAR_SEGMENT) * (JPEG_PAR_MAX_SEGMENTS + 1));
+    if (!pSegments) { s_iParallelLastReason = JPEG_PAR_MEMORY; return 0; }
+
+    int iSegmentCount = 0, iTotalMCUs = 0, cx = 0, cy = 0, mcuCX = 0, mcuCY = 0;
+    if (!JPEGScanRestartSegments(pJPEG, pSegments, &iSegmentCount, &iTotalMCUs,
+                                 &cx, &cy, &mcuCX, &mcuCY)) {
+        free(pSegments);
+        s_iParallelLastReason = JPEG_PAR_SCAN_ERROR;
+        return 0;
+    }
+    if (iSegmentCount < 2) { // a single segment has nothing to parallelize
+        free(pSegments);
+        s_iParallelLastReason = JPEG_PAR_BAD_GRID;
+        return 0;
+    }
+
+    int iScaleShift = (pJPEG->iOptions & JPEG_SCALE_HALF) ? 1 : 0;
+    mcuCX >>= iScaleShift;
+    mcuCY >>= iScaleShift;
+    int iOutWidth = (pJPEG->iWidth + ((1 << iScaleShift) - 1)) >> iScaleShift;
+    int iOutHeight = (pJPEG->iHeight + ((1 << iScaleShift) - 1)) >> iScaleShift;
+    int iPixelSize = (pJPEG->ucPixelType == RGB8888) ? 4 :
+                     (pJPEG->ucPixelType == EIGHT_BIT_GRAYSCALE) ? 1 : 2;
+    int iRowPitchBytes = iOutWidth * iPixelSize;
+    size_t tImageBytes = (size_t)iRowPitchBytes * iOutHeight;
+    // One full MCU row of scratch per worker. Size on the MCU-padded width
+    // (not the clipped output width) plus 16 bytes of tail slack, because the
+    // SSE2 PutMCU paths can overrun the final MCU's right edge by a few bytes.
+    int iPaddedWidth = cx * mcuCX;
+    size_t tRowBufferBytes = (size_t)iPaddedWidth * mcuCY * iPixelSize + 16;
+
+    JPEG_PAR_JOB job;
+    memset(&job, 0, sizeof(job));
+    job.pParent = pJPEG;
+    job.pSegments = pSegments;
+    job.iSegmentCount = iSegmentCount;
+    job.iNextSegment = 0;
+    job.iImageMCUsX = cx;
+    job.iImageMCUsY = cy;
+    job.iMCUCX = mcuCX;
+    job.iMCUCY = mcuCY;
+    job.iScaleShift = iScaleShift;
+    job.iOutWidth = iOutWidth;
+    job.iOutHeight = iOutHeight;
+    job.iPixelSize = iPixelSize;
+    job.iRowPitchBytes = iRowPitchBytes;
+    job.iRowBufferBytes = (int)tRowBufferBytes;
+
+    uint8_t *pPrivateImage = NULL;
+    if (pJPEG->pFramebuffer) {
+        job.pOutImage = (uint8_t *)pJPEG->pFramebuffer;
+        job.bUserFramebuffer = 1;
+    } else {
+        pPrivateImage = (uint8_t *)malloc(tImageBytes);
+        if (!pPrivateImage) {
+            free(pSegments);
+            s_iParallelLastReason = JPEG_PAR_MEMORY;
+            return 0;
+        }
+        job.pOutImage = pPrivateImage;
+    }
+
+    int iThreads = s_iParallelThreads;
+    if (iThreads > iSegmentCount)
+        iThreads = iSegmentCount;
+    if (iThreads < 1)
+        iThreads = 1;
+
+    // The shared job's mutex guards both the segment queue and the row
+    // assembly publish step. Worker threads come from the persistent pool,
+    // so repeated decodes pay no pthread_create/join cost.
+    pthread_mutex_init(&job.mutex, NULL);
+    int iAvail = JPEGParallelEnsurePool(iThreads);
+    if (iAvail < 1) {
+        pthread_mutex_destroy(&job.mutex);
+        free(pPrivateImage);
+        free(pSegments);
+        s_iParallelLastReason = JPEG_PAR_MEMORY;
+        return 0;
+    }
+    if (iThreads > iAvail)
+        iThreads = iAvail;
+    int iRunError = JPEGParallelRunJob(&job, iThreads);
+    pthread_mutex_destroy(&job.mutex);
+
+    int bOK = (iRunError == 0);
+    if (!bOK) {
+        // Worker hit corrupt entropy data: discard everything and let the
+        // serial path decode (and report the error) with untouched state.
+        free(pPrivateImage);
+        free(pSegments);
+        s_iParallelLastReason = JPEG_PAR_WORKER_FAILED;
+        return 0;
+    }
+
+    // No framebuffer: replay the assembled image through the user callback,
+    // one MCU row per JPEGDRAW call (same block geometry as the serial path).
+    if (!job.bUserFramebuffer) {
+        JPEGDRAW jd;
+        memset(&jd, 0, sizeof(jd));
+        jd.iBpp = pJPEG->ucPixelType == RGB8888 ? 32 :
+                  pJPEG->ucPixelType == EIGHT_BIT_GRAYSCALE ? 8 : 16;
+        jd.iHeight = mcuCY;
+        jd.pUser = pJPEG->pUser;
+        int bContinue = 1;
+        for (int y = 0; y < cy && bContinue; y++) {
+            jd.x = pJPEG->iXOffset;
+            jd.y = pJPEG->iYOffset + y * mcuCY;
+            jd.iWidth = jd.iWidthUsed = cx * mcuCX;
+            if (jd.iWidth > iOutWidth)
+                jd.iWidthUsed = iOutWidth;
+            if (jd.y - pJPEG->iYOffset + mcuCY > iOutHeight)
+                jd.iHeight = iOutHeight - (jd.y - pJPEG->iYOffset);
+            else
+                jd.iHeight = mcuCY;
+            jd.pPixels = (uint16_t *)(pPrivateImage + (size_t)y * mcuCY * iRowPitchBytes);
+            bContinue = (*pJPEG->pfnDraw)(&jd);
+        }
+        free(pPrivateImage);
+        if (!bContinue) {
+            // Callback asked to stop; mirror the serial contract (no error set)
+            free(pSegments);
+            s_iParallelLastFellBack = 0;
+            s_iParallelLastSegments = iSegmentCount;
+            s_iParallelLastThreadsUsed = iThreads;
+            s_iParallelLastReason = JPEG_PAR_OK;
+            return 1;
+        }
+    }
+
+    free(pSegments);
+    s_iParallelLastFellBack = 0;
+    s_iParallelLastSegments = iSegmentCount;
+    s_iParallelLastThreadsUsed = iThreads;
+    s_iParallelLastReason = JPEG_PAR_OK;
+    return 1;
+} /* JPEGDecodeParallel() */
+
+//
+// Configuration / diagnostics (new free functions; existing public
+// signatures are unchanged).
+//
+void JPEG_setParallel(int iEnable)
+{
+    JPEGParallelInitConfig();
+    s_iParallelEnabled = iEnable ? 1 : 0;
+}
+
+void JPEG_setParallelThreads(int iThreadCount)
+{
+    JPEGParallelInitConfig();
+    if (iThreadCount < 1)
+        iThreadCount = 1;
+    if (iThreadCount > JPEG_PAR_MAX_THREADS)
+        iThreadCount = JPEG_PAR_MAX_THREADS;
+    s_iParallelThreads = iThreadCount;
+}
+
+void JPEG_setParallelMinSegmentMCUs(int iMinMCUs)
+{
+    JPEGParallelInitConfig();
+    if (iMinMCUs < 1)
+        iMinMCUs = 1;
+    s_iParallelMinSegmentMCUs = iMinMCUs;
+}
+
+void JPEG_getParallelStats(int *piSegments, int *piThreadsUsed,
+                           int *piFellBack, int *piReason)
+{
+    JPEGParallelInitConfig();
+    if (piSegments) *piSegments = s_iParallelLastSegments;
+    if (piThreadsUsed) *piThreadsUsed = s_iParallelLastThreadsUsed;
+    if (piFellBack) *piFellBack = s_iParallelLastFellBack;
+    if (piReason) *piReason = s_iParallelLastReason;
+}
+#endif // __MACH__ || __LINUX__
