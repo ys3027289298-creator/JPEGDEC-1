@@ -1,0 +1,10 @@
+tulips 640x480 4:2:0, 56010 bytes JPEG; Y plane = 307200 bytes (300.0 KB)
+statistics over 101 open+decode cycles, microseconds
+mode                            min_us    median min_delta%
+single RGB565                      626       674      +0.0%
+single RGB8888                     605       651      -3.4%
+Y-only (LUMA_ONLY)                 488       510     -22.0%
+dual RGB565 + Y                    653       680      +4.3%
+dual RGB8888 + Y                   644       671      +2.9%
+dual RGB only (bOutputY=0)         618       647      -1.3%
+Y-only + dual Y plane              519       541     -17.1%

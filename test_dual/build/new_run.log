@@ -1,0 +1,143 @@
+sizeof(JPEGIMAGE) = 17944 bytes (decoder-state footprint)
+image color420_31x17   31x17 subsample=0x22 jpeg=920 bytes, Y plane=527 bytes (packed), 663 bytes (pitch 39)
+image color444_17x11   17x11 subsample=0x11 jpeg=761 bytes, Y plane=187 bytes (packed), 275 bytes (pitch 25)
+image color422_19x9    19x9  subsample=0x21 jpeg=700 bytes, Y plane=171 bytes (packed), 243 bytes (pitch 27)
+image gray_24x16       24x16 subsample=0x00 jpeg=535 bytes, Y plane=384 bytes (packed), 512 bytes (pitch 32)
+single-output reference dumps written
+
+== color420_31x17 ==
+  ok:   dual RGB565+Y decode succeeds
+  ok:   dual reports Y dimensions
+  ok:   dual RGB565 pixels identical to single output
+  ok:   dual Y plane identical to luma-only grayscale output
+  ok:   Y plane stride padding untouched
+  ok:   dual RGB8888+Y decode succeeds (pitch 0 => packed)
+  ok:   pitch 0 resolved to image width
+  ok:   dual RGB8888 pixels identical to single output
+  ok:   packed Y plane identical to grayscale output
+  ok:   dual RGB565-BE+Y decode succeeds
+  ok:   dual RGB565-BE pixels identical to single output
+  ok:   RGB565-BE dual Y plane identical to grayscale output
+  ok:   dual decode with bOutputY=0 succeeds without Y buffer
+  ok:   RGB-only dual path pixels identical to single output
+  ok:   Y-only (LUMA_ONLY|DUAL) decode succeeds
+  ok:   Y-only plane identical to grayscale reference
+  ok:   NULL user pointer rejected
+  ok:   bad magic rejected
+  ok:   bOutputY=1 with NULL Y plane rejected
+  ok:   negative pitch rejected
+  ok:   pitch smaller than width rejected
+  ok:   illegal bOutputY value rejected
+  ok:   dual output combined with scaling rejected
+  ok:   dual output combined with dithered pixel type rejected
+
+== color444_17x11 ==
+  ok:   dual RGB565+Y decode succeeds
+  ok:   dual reports Y dimensions
+  ok:   dual RGB565 pixels identical to single output
+  ok:   dual Y plane identical to luma-only grayscale output
+  ok:   Y plane stride padding untouched
+  ok:   dual RGB8888+Y decode succeeds (pitch 0 => packed)
+  ok:   pitch 0 resolved to image width
+  ok:   dual RGB8888 pixels identical to single output
+  ok:   packed Y plane identical to grayscale output
+  ok:   dual RGB565-BE+Y decode succeeds
+  ok:   dual RGB565-BE pixels identical to single output
+  ok:   RGB565-BE dual Y plane identical to grayscale output
+  ok:   dual decode with bOutputY=0 succeeds without Y buffer
+  ok:   RGB-only dual path pixels identical to single output
+  ok:   Y-only (LUMA_ONLY|DUAL) decode succeeds
+  ok:   Y-only plane identical to grayscale reference
+  ok:   NULL user pointer rejected
+  ok:   bad magic rejected
+  ok:   bOutputY=1 with NULL Y plane rejected
+  ok:   negative pitch rejected
+  ok:   pitch smaller than width rejected
+  ok:   illegal bOutputY value rejected
+  ok:   dual output combined with scaling rejected
+  ok:   dual output combined with dithered pixel type rejected
+
+== color422_19x9 ==
+  ok:   dual RGB565+Y decode succeeds
+  ok:   dual reports Y dimensions
+  ok:   dual RGB565 pixels identical to single output
+  ok:   dual Y plane identical to luma-only grayscale output
+  ok:   Y plane stride padding untouched
+  ok:   dual RGB8888+Y decode succeeds (pitch 0 => packed)
+  ok:   pitch 0 resolved to image width
+  ok:   dual RGB8888 pixels identical to single output
+  ok:   packed Y plane identical to grayscale output
+  ok:   dual RGB565-BE+Y decode succeeds
+  ok:   dual RGB565-BE pixels identical to single output
+  ok:   RGB565-BE dual Y plane identical to grayscale output
+  ok:   dual decode with bOutputY=0 succeeds without Y buffer
+  ok:   RGB-only dual path pixels identical to single output
+  ok:   Y-only (LUMA_ONLY|DUAL) decode succeeds
+  ok:   Y-only plane identical to grayscale reference
+  ok:   NULL user pointer rejected
+  ok:   bad magic rejected
+  ok:   bOutputY=1 with NULL Y plane rejected
+  ok:   negative pitch rejected
+  ok:   pitch smaller than width rejected
+  ok:   illegal bOutputY value rejected
+  ok:   dual output combined with scaling rejected
+  ok:   dual output combined with dithered pixel type rejected
+
+== gray_24x16 ==
+  ok:   dual RGB565+Y decode succeeds
+  ok:   dual reports Y dimensions
+  ok:   dual RGB565 pixels identical to single output
+  ok:   dual Y plane identical to luma-only grayscale output
+  ok:   Y plane stride padding untouched
+  ok:   dual RGB8888+Y decode succeeds (pitch 0 => packed)
+  ok:   pitch 0 resolved to image width
+  ok:   dual RGB8888 pixels identical to single output
+  ok:   packed Y plane identical to grayscale output
+  ok:   dual RGB565-BE+Y decode succeeds
+  ok:   dual RGB565-BE pixels identical to single output
+  ok:   RGB565-BE dual Y plane identical to grayscale output
+  ok:   dual decode with bOutputY=0 succeeds without Y buffer
+  ok:   RGB-only dual path pixels identical to single output
+  ok:   Y-only (LUMA_ONLY|DUAL) decode succeeds
+  ok:   Y-only plane identical to grayscale reference
+  ok:   NULL user pointer rejected
+  ok:   bad magic rejected
+  ok:   bOutputY=1 with NULL Y plane rejected
+  ok:   negative pitch rejected
+  ok:   pitch smaller than width rejected
+  ok:   illegal bOutputY value rejected
+  ok:   dual output combined with scaling rejected
+  ok:   dual output combined with dithered pixel type rejected
+
+== timing: median microseconds/open+decode over 101 iterations (small images; see bench_tulips for stable numbers) ==
+image            mode                    median_us     delta%
+color420_31x17   single RGB565                   4      +0.0%
+color420_31x17   single RGB8888                  4      +0.0%
+color420_31x17   Y-only (no dual)                4      +0.0%
+color420_31x17   dual RGB565+Y                   4      +0.0%
+color420_31x17   dual RGB8888+Y                  4      +0.0%
+color420_31x17   dual RGB only                   4      +0.0%
+color420_31x17   Y-only dual plane               3     -25.0%
+color444_17x11   single RGB565                   2      +0.0%
+color444_17x11   single RGB8888                  2      +0.0%
+color444_17x11   Y-only (no dual)                2      +0.0%
+color444_17x11   dual RGB565+Y                   3     +50.0%
+color444_17x11   dual RGB8888+Y                  3     +50.0%
+color444_17x11   dual RGB only                   3     +50.0%
+color444_17x11   Y-only dual plane               3     +50.0%
+color422_19x9    single RGB565                   4      +0.0%
+color422_19x9    single RGB8888                  4      +0.0%
+color422_19x9    Y-only (no dual)                2     -50.0%
+color422_19x9    dual RGB565+Y                   4      +0.0%
+color422_19x9    dual RGB8888+Y                  4      +0.0%
+color422_19x9    dual RGB only                   3     -25.0%
+color422_19x9    Y-only dual plane               3     -25.0%
+gray_24x16       single RGB565                   2      +0.0%
+gray_24x16       single RGB8888                  2      +0.0%
+gray_24x16       Y-only (no dual)                2      +0.0%
+gray_24x16       dual RGB565+Y                   3     +50.0%
+gray_24x16       dual RGB8888+Y                  2      +0.0%
+gray_24x16       dual RGB only                   2      +0.0%
+gray_24x16       Y-only dual plane               2      +0.0%
+
+ALL TESTS PASSED

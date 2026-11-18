@@ -68,6 +68,42 @@ int16_t i16_Consts[8] = {0x80, 113, 90, 22, 46, 1,32,2048};
 #define HAS_NEON
 #endif
 
+//===========================================================================
+// Dual output option (RGB packed pixels + independent Y plane in one decode)
+//
+// Pass JPEG_DUAL_OUTPUT in the iOptions bitmask of decode()/JPEG_decode() and
+// hand the decoder a JPEG_DUAL_PLANE descriptor through setUserPointer()/
+// JPEG_setUserPointer(). The single IDCT result held in sMCUs is used for both
+// outputs, so the bitstream is parsed and IDCT'd exactly once. The packed RGB
+// pixel path is untouched and stays bit-identical; the extra Y plane is simply
+// copied out of the already decoded luma block(s).
+//
+// Only full-resolution output (no JPEG_SCALE_* option) is supported; asking for
+// scaling together with JPEG_DUAL_OUTPUT is rejected with JPEG_INVALID_PARAMETER.
+//===========================================================================
+#ifndef JPEG_DUAL_OUTPUT
+#define JPEG_DUAL_OUTPUT 0x00000100 // decode() option bit (bits 0x80 and below are taken)
+#endif
+// Magic value stored in JPEG_DUAL_PLANE.u32Magic; lets the library reject
+// garbage/uninitialized user pointers instead of writing through them.
+#define JPEG_DUAL_MAGIC 0x44554144u // 'DUAL'
+//
+// Application-visible descriptor. It is defined here instead of JPEGDEC.h so
+// that no public header/interface changes are needed. Applications copy this
+// exact layout (same field order/types) into their own code; the magic below
+// guards against a mismatched/stale copy. On 64-bit targets the pointer plus
+// default alignment naturally pad the struct to 32 bytes, on 32-bit to 20.
+//
+typedef struct jpeg_dual_plane_tag
+{
+    uint32_t u32Magic;     // must be JPEG_DUAL_MAGIC
+    uint8_t *pYPlane;      // destination buffer for the independent Y plane
+    int iYPitch;           // bytes per row of pYPlane (0 means tightly packed)
+    int iYWidth;           // filled in by the library: usable Y width in pixels
+    int iYHeight;          // filled in by the library: usable Y height in pixels
+    int bOutputY;          // 1 = write the Y plane, 0 = RGB output only
+} JPEG_DUAL_PLANE;
+
 // forward references
 static int JPEGInit(JPEGIMAGE *pJPEG);
 static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb);
@@ -2818,6 +2854,61 @@ int16x8_t mmxZ5, mmxZ10, mmxZ11, mmxZ12, mmxZ13;
         pOutput += 8;
     } // for each row
 } /* JPEGIDCT() */
+
+//
+// Copy the luma byte(s) of the MCU just decoded into the independent Y plane
+// of a dual-output decode. The bytes come straight out of the IDCT result in
+// pJPEG->sMCUs, which the packed-RGB output path is using at the same time -
+// no second Huffman decode or IDCT is performed.
+//
+// Full resolution only (validated in DecodeJPEG), so every 8x8 luma block is
+// stored verbatim. Edge blocks of odd-sized images are clipped to the real
+// image dimensions exactly like the grayscale output path does.
+//
+// Luma blocks occupy the first iBlocksX*iBlocksY DCT-sized slots of sMCUs,
+// each slot holding one contiguous 8x8 byte array, laid out row-major:
+//   [block(0,0) block(1,0) ... block(iBlocksX-1,0) block(0,1) ...]
+//
+static void JPEGWriteDualY(JPEGIMAGE *pJPEG, int iMCUx, int iMCUy, int iMcuCX, int iMcuCY)
+{
+    JPEG_DUAL_PLANE *pDual = (JPEG_DUAL_PLANE *)pJPEG->pUser;
+    uint8_t *pYPlane = pDual->pYPlane;
+    int iYPitch = pDual->iYPitch;
+    uint8_t *pDest;
+    int iBlocksX, iBlocksY, iBX, iBY, iRow, iX, iY, iCopyW;
+
+    if (!pYPlane || !pDual->bOutputY)
+        return;
+    iBlocksX = iMcuCX >> 3; // luma blocks per MCU row (1 or 2)
+    iBlocksY = iMcuCY >> 3; // luma blocks per MCU column (1 or 2)
+    // Destination origin of this MCU in the (possibly padded) Y plane
+    pDest = pYPlane + (iMCUy * iMcuCY) * iYPitch + (iMCUx * iMcuCX);
+
+    for (iBY = 0; iBY < iBlocksY; iBY++)
+    {
+        for (iBX = 0; iBX < iBlocksX; iBX++)
+        {
+            // Contiguous 64-byte slot for this 8x8 luma block
+            uint8_t *pBlock = (uint8_t *)&pJPEG->sMCUs[(iBY * iBlocksX + iBX) * DCTSIZE];
+            uint8_t *pRow = pDest + iBY * 8 * iYPitch + iBX * 8;
+            for (iRow = 0; iRow < 8; iRow++)
+            {
+                iY = iMCUy * iMcuCY + iBY * 8 + iRow;
+                if (iY >= pJPEG->iHeight)
+                    break; // bottom padding of the final MCU
+                iX = iMCUx * iMcuCX + iBX * 8;
+                iCopyW = pJPEG->iWidth - iX;
+                if (iCopyW > 8)
+                    iCopyW = 8;
+                if (iCopyW > 0)
+                    memcpy(pRow, pBlock, iCopyW); // right-edge clipping
+                pBlock += 8;
+                pRow += iYPitch;
+            }
+        }
+    }
+} /* JPEGWriteDualY() */
+
 static void JPEGPutMCU8BitGray(JPEGIMAGE *pJPEG, int x, int iPitch)
 {
     int i, j, xcount, ycount;
@@ -5035,6 +5126,51 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     unsigned char cDCTable0, cACTable0, cDCTable1, cACTable1, cDCTable2, cACTable2;
     JPEGDRAW jd;
     int iMaxFill = 16, iScaleShift = 0;
+    int bDualOutput = (pJPEG->iOptions & JPEG_DUAL_OUTPUT) ? 1 : 0;
+    JPEG_DUAL_PLANE *pDual = NULL;
+
+    if (bDualOutput)
+    {
+        // Everything about the dual-plane layout is validated up front so a
+        // bad parameter is reported before any scan data is touched.
+        pDual = (JPEG_DUAL_PLANE *)pJPEG->pUser;
+        // Reject anything that cannot be a real descriptor instead of
+        // trusting an arbitrary pUser pointer.
+        if (pDual == NULL || pDual->u32Magic != JPEG_DUAL_MAGIC) {
+            pJPEG->iError = JPEG_INVALID_PARAMETER;
+            return 0;
+        }
+        if (pDual->bOutputY != 0 && pDual->bOutputY != 1) {
+            pJPEG->iError = JPEG_INVALID_PARAMETER;
+            return 0;
+        }
+        if (pDual->bOutputY && pDual->pYPlane == NULL) {
+            pJPEG->iError = JPEG_INVALID_PARAMETER;
+            return 0;
+        }
+        // The independent Y plane mirrors the full-resolution luma samples;
+        // downscaled output has no matching 1:1 plane, so reject the mix.
+        if (pJPEG->iOptions & (JPEG_SCALE_HALF | JPEG_SCALE_QUARTER | JPEG_SCALE_EIGHTH)) {
+            pJPEG->iError = JPEG_INVALID_PARAMETER;
+            return 0;
+        }
+        // Dithered pixel types own pUser/pDitherBuffer style output and cannot
+        // be combined with the dual-plane descriptor.
+        if (pJPEG->ucPixelType > EIGHT_BIT_GRAYSCALE) {
+            pJPEG->iError = JPEG_INVALID_PARAMETER;
+            return 0;
+        }
+        // Pitch 0 selects tightly packed rows (width bytes per row).
+        if (pDual->iYPitch < 0 ||
+            (pDual->iYPitch != 0 && pDual->iYPitch < pJPEG->iWidth)) {
+            pJPEG->iError = JPEG_INVALID_PARAMETER;
+            return 0;
+        }
+        if (pDual->iYPitch == 0)
+            pDual->iYPitch = pJPEG->iWidth;
+        pDual->iYWidth = pJPEG->iWidth;
+        pDual->iYHeight = pJPEG->iHeight;
+    }
 
     // Requested the Exif thumbnail
     if (pJPEG->ucMode == 0xc2) { // progressive mode - we only decode the first scan (DC values)
@@ -5371,6 +5507,11 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                             break;
                     } // switch on color option
                 } // normal MCU drawing
+                if (bDualOutput && pDual->bOutputY) {
+                    // Same sMCUs IDCT result as the packed output above - the
+                    // bitstream is decoded only once.
+                    JPEGWriteDualY(pJPEG, x, y, mcuCX, mcuCY);
+                }
                 xoff += mcuCX;
             } // if not skipped
             if (pJPEG->pFramebuffer == NULL && (xoff == iPitch || x == cx-1) && !iSkipMask) // time to draw

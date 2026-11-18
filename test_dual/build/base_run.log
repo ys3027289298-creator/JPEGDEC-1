@@ -1,0 +1,7 @@
+sizeof(JPEGIMAGE) = 17944 bytes (decoder-state footprint)
+image color420_31x17   31x17 subsample=0x22 jpeg=920 bytes, Y plane=527 bytes (packed), 663 bytes (pitch 39)
+image color444_17x11   17x11 subsample=0x11 jpeg=761 bytes, Y plane=187 bytes (packed), 275 bytes (pitch 25)
+image color422_19x9    19x9  subsample=0x21 jpeg=700 bytes, Y plane=171 bytes (packed), 243 bytes (pitch 27)
+image gray_24x16       24x16 subsample=0x00 jpeg=535 bytes, Y plane=384 bytes (packed), 512 bytes (pitch 32)
+single-output reference dumps written
+dumps-only mode: stopping before dual-output tests
