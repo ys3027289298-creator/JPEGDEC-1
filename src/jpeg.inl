@@ -1071,8 +1071,9 @@ static int JPEGMakeHuffTables_Slow(JPEGIMAGE *pJPEG, int bThumbnail)
 //
 // Expand the Huffman tables for fast decoding
 // returns 1 for success, 0 for failure
+// (this is the "build" half; the caching wrapper is JPEGMakeHuffTables below)
 //
-static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
+static int JPEGBuildHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
 {
     int code, repeat, count, codestart;
     int j;
@@ -1283,6 +1284,418 @@ static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
         } // if table defined
     }
     return 1;
+} /* JPEGBuildHuffTables() */
+
+//
+// Huffman table cache
+// -------------------
+// Decoding many JPEG images (e.g. MJPEG video or a slideshow) normally
+// rebuilds the fast Huffman decode tables for every frame. Most encoders
+// emit the standard ISO/IEC 10918-1 (Annex K) Huffman tables, so the
+// expanded tables are identical from frame to frame. This cache keeps the
+// expanded tables in the decoder context and reuses them when the
+// fingerprint of the DHT data matches a cached entry; on any mismatch it
+// falls back to rebuilding. Images with custom Huffman tables are always
+// rebuilt per frame and are never inserted into the cache.
+//
+// The cache is shared by all JPEGDEC instances in this translation unit
+// (the decode context for the C core). A corrupted cache entry is detected
+// by its checksum before use; it is then discarded, the tables are rebuilt
+// from the source DHT data and the entry is repaired (self-healing), so decode
+// output is unaffected.
+//
+// Runtime configuration (no public header changes; see JPEGDEC wiki to expose
+// these if desired):
+//   int  JPEGHuffCacheSetCapacity(int iCapacity); // 0 disables, -1 on error
+//   int  JPEGHuffCacheGetCapacity(void);
+//   int  JPEGHuffCacheGetMemory(void);   // bytes used by active cache entries
+//   void JPEGHuffCacheSetStatsEnable(int bEnable);
+//   void JPEGHuffCacheGetStats(uint32_t *pulHits, uint32_t *pulMisses,
+//                              uint32_t *pulBuilds, uint32_t *pulCorruptions);
+//   void JPEGHuffCacheResetStats(void);
+//   void JPEGHuffCacheFlush(void);
+//   uint8_t *JPEGHuffCacheGetEntryData(int iEntry, int *piSize); // test hook
+//
+#ifndef JPEG_HUFF_CACHE_MAX
+#define JPEG_HUFF_CACHE_MAX 4 // compile-time upper bound on cache entries
+#endif // (color/gray x baseline/progressive standard table sets)
+#define JPEG_HUFF_MAGIC 0x48554646 // "HUFF" little-endian
+
+#if JPEG_HUFF_CACHE_MAX > 0
+typedef struct jpeg_huff_entry_tag
+{
+    uint32_t ulMagic;       // JPEG_HUFF_MAGIC when the entry is valid
+    uint32_t ulChecksum;    // integrity checksum of the expanded tables
+    uint32_t ulFingerprint; // fingerprint of the source DHT data
+    uint32_t ulLastUse;     // LRU clock
+    uint8_t ucMask;         // ucHuffTableUsed
+    uint8_t ucMode;         // ucMode (e.g. 0xc0 baseline, 0xc2 progressive)
+    uint8_t ucPad[2];
+    uint8_t ucDC[DC_TABLE_SIZE * 2]; // expanded DC tables
+    uint16_t usAC[HUFF11SIZE * 2];   // expanded AC tables
+} JPEGHUFFENTRY;
+
+static JPEGHUFFENTRY s_HuffCache[JPEG_HUFF_CACHE_MAX];
+static int s_iHuffCacheCap = JPEG_HUFF_CACHE_MAX; // active capacity
+static int s_iHuffCacheStats = 1; // statistics collection enabled
+static uint32_t s_ulHuffClock = 0; // LRU clock
+static uint32_t s_ulHuffHits = 0, s_ulHuffMisses = 0;
+static uint32_t s_ulHuffBuilds = 0, s_ulHuffCorrupt = 0;
+
+//
+// The standard (Annex K) Huffman tables, stored as 16 count bytes
+// followed by the symbol values
+//
+static const uint8_t s_StdDCLuma[16+12] =
+{   0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0,
+    0,1,2,3,4,5,6,7,8,9,10,11 };
+static const uint8_t s_StdDCChroma[16+12] =
+{   0,3,1,1,1,1,1,1,1,1,1,0,0,0,0,0,
+    0,1,2,3,4,5,6,7,8,9,10,11 };
+static const uint8_t s_StdACLuma[16+162] =
+{   0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,0x7d,
+    0x01,0x02,0x03,0x00,0x04,0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,0x51,0x61,0x07,
+    0x22,0x71,0x14,0x32,0x81,0x91,0xa1,0x08,0x23,0x42,0xb1,0xc1,0x15,0x52,0xd1,0xf0,
+    0x24,0x33,0x62,0x72,0x82,0x09,0x0a,0x16,0x17,0x18,0x19,0x1a,0x25,0x26,0x27,0x28,
+    0x29,0x2a,0x34,0x35,0x36,0x37,0x38,0x39,0x3a,0x43,0x44,0x45,0x46,0x47,0x48,0x49,
+    0x4a,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x63,0x64,0x65,0x66,0x67,0x68,0x69,
+    0x6a,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x83,0x84,0x85,0x86,0x87,0x88,0x89,
+    0x8a,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,
+    0xa8,0xa9,0xaa,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xc2,0xc3,0xc4,0xc5,
+    0xc6,0xc7,0xc8,0xc9,0xca,0xd2,0xd3,0xd4,0xd5,0xd6,0xd7,0xd8,0xd9,0xda,0xe1,0xe2,
+    0xe3,0xe4,0xe5,0xe6,0xe7,0xe8,0xe9,0xea,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,
+    0xf9,0xfa };
+static const uint8_t s_StdACChroma[16+162] =
+{   0,2,1,2,4,4,3,4,7,5,4,4,0,1,2,0x77,
+    0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x51,0x07,0x61,0x71,
+    0x13,0x22,0x32,0x81,0x08,0x14,0x42,0x91,0xa1,0xb1,0xc1,0x09,0x23,0x33,0x52,0xf0,
+    0x15,0x62,0x72,0xd1,0x0a,0x16,0x24,0x34,0xe1,0x25,0xf1,0x17,0x18,0x19,0x1a,0x26,
+    0x27,0x28,0x29,0x2a,0x35,0x36,0x37,0x38,0x39,0x3a,0x43,0x44,0x45,0x46,0x47,0x48,
+    0x49,0x4a,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x63,0x64,0x65,0x66,0x67,0x68,
+    0x69,0x6a,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x82,0x83,0x84,0x85,0x86,0x87,
+    0x88,0x89,0x8a,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0xa2,0xa3,0xa4,0xa5,
+    0xa6,0xa7,0xa8,0xa9,0xaa,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xc2,0xc3,
+    0xc4,0xc5,0xc6,0xc7,0xc8,0xc9,0xca,0xd2,0xd3,0xd4,0xd5,0xd6,0xd7,0xd8,0xd9,0xda,
+    0xe2,0xe3,0xe4,0xe5,0xe6,0xe7,0xe8,0xe9,0xea,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,
+    0xf9,0xfa };
+//
+// Map a DHT slot (0-3 = DC 0-3, 4-7 = AC 0-3) to its standard table
+// returns NULL for slots which have no standard definition
+//
+static const uint8_t *JPEGHuffStdTable(int iSlot)
+{
+    switch (iSlot)
+    {
+        case 0: return s_StdDCLuma;
+        case 1: return s_StdDCChroma;
+        case 4: return s_StdACLuma;
+        case 5: return s_StdACChroma;
+        default: return NULL;
+    }
+} /* JPEGHuffStdTable() */
+//
+// FNV-1a style hash helper, one 32-bit word per step (bytes are assembled
+// individually so there are no alignment requirements)
+//
+static uint32_t JPEGHuffFNV(const uint8_t *pData, int iLen, uint32_t h)
+{
+    while (iLen >= 4)
+    {
+        h ^= (uint32_t)pData[0] | ((uint32_t)pData[1] << 8) |
+             ((uint32_t)pData[2] << 16) | ((uint32_t)pData[3] << 24);
+        h *= 16777619u;
+        pData += 4;
+        iLen -= 4;
+    }
+    while (iLen-- > 0)
+    {
+        h ^= *pData++;
+        h *= 16777619u;
+    }
+    return h;
+} /* JPEGHuffFNV() */
+//
+// Fingerprint the DHT data of the current image. The hash covers the
+// table-used mask, the frame mode and, for each defined table, the 16
+// code-length counts and the symbol values. It is independent of the
+// order/splitting of the DHT segments in the file.
+//
+static uint32_t JPEGHuffFingerprint(JPEGIMAGE *pJPEG)
+{
+    uint8_t *pHuffVals = (uint8_t *)pJPEG->usPixels; // where JPEGGetHuffTables() stored them
+    uint32_t h = 2166136261u;
+    int i, j, iCount;
+    uint8_t uc;
+
+    h = JPEGHuffFNV(&pJPEG->ucHuffTableUsed, 1, h);
+    h = JPEGHuffFNV(&pJPEG->ucMode, 1, h);
+    for (i = 0; i < 8; i++)
+    {
+        if (pJPEG->ucHuffTableUsed & (1 << i))
+        {
+            uint8_t *pT = &pHuffVals[i * HUFF_TABLEN];
+            iCount = 0;
+            for (j = 0; j < 16; j++)
+                iCount += pT[j];
+            uc = (uint8_t)i;
+            h = JPEGHuffFNV(&uc, 1, h);
+            h = JPEGHuffFNV(pT, 16 + iCount, h);
+        }
+    }
+    return h;
+} /* JPEGHuffFingerprint() */
+//
+// Check if every Huffman table defined by the current image is identical
+// to the corresponding standard (Annex K) table
+//
+static int JPEGHuffIsStandard(JPEGIMAGE *pJPEG)
+{
+    uint8_t *pHuffVals = (uint8_t *)pJPEG->usPixels;
+    int i, j, iCount;
+
+    if (pJPEG->ucHuffTableUsed == 0)
+        return 0; // no tables, nothing worth caching
+    for (i = 0; i < 8; i++)
+    {
+        if (pJPEG->ucHuffTableUsed & (1 << i))
+        {
+            const uint8_t *pStd = JPEGHuffStdTable(i);
+            uint8_t *pT = &pHuffVals[i * HUFF_TABLEN];
+            if (pStd == NULL)
+                return 0; // no standard table exists for this slot
+            iCount = 0;
+            for (j = 0; j < 16; j++)
+                iCount += pT[j];
+            if (memcmp(pT, pStd, 16) != 0) // code-length counts
+                return 0;
+            if (memcmp(&pT[16], &pStd[16], iCount) != 0) // symbol values
+                return 0;
+        }
+    }
+    return 1;
+} /* JPEGHuffIsStandard() */
+//
+// The expanded tables are stored/copied/checksummed as up to 4 segments,
+// one per defined table, so that images using a subset of the tables
+// (e.g. grayscale) don't pay for the unused parts.
+// DC table i occupies DC_TABLE_SIZE bytes at offset i*DC_TABLE_SIZE of
+// ucHuffDC; AC table i occupies HUFF11SIZE uint16s at uint16 offset
+// i*HUFF11SIZE of usHuffAC.
+//
+static void JPEGHuffCopySegs(uint8_t *pDstDC, uint8_t *pDstAC, const uint8_t *pSrcDC, const uint8_t *pSrcAC, uint8_t ucMask)
+{
+    if (ucMask & 0x01)
+        memcpy(pDstDC, pSrcDC, DC_TABLE_SIZE);
+    if (ucMask & 0x02)
+        memcpy(pDstDC + DC_TABLE_SIZE, pSrcDC + DC_TABLE_SIZE, DC_TABLE_SIZE);
+    if (ucMask & 0x10)
+        memcpy(pDstAC, pSrcAC, HUFF11SIZE*2);
+    if (ucMask & 0x20)
+        memcpy(pDstAC + HUFF11SIZE*2, pSrcAC + HUFF11SIZE*2, HUFF11SIZE*2);
+} /* JPEGHuffCopySegs() */
+//
+// Integrity checksum of a cache entry's expanded tables.
+// Fast 2-lane word checksum (rotate + add); runs over the cache entry's
+// own storage which is 4-byte aligned by construction. Only the segments
+// for tables named by ucMask are covered.
+//
+static void JPEGHuffChecksumSeg(const uint8_t *p, int iWords, uint32_t *ph0, uint32_t *ph1)
+{
+    const uint32_t *p32 = (const uint32_t *)p;
+    uint32_t h0 = *ph0, h1 = *ph1;
+    int i;
+
+    for (i = 0; i < iWords; i += 4)
+    {
+        h0 += p32[i];
+        h1 += p32[i+1];
+        h0 = (h0 << 7) | (h0 >> 25);
+        h1 += p32[i+2] ^ h0;
+        h0 += p32[i+3];
+        h1 = (h1 << 3) | (h1 >> 29);
+    }
+    *ph0 = h0;
+    *ph1 = h1;
+} /* JPEGHuffChecksumSeg() */
+
+static uint32_t JPEGHuffEntryChecksum(JPEGHUFFENTRY *pEnt)
+{
+    uint32_t h0 = 2166136261u, h1 = 0x9e3779b9u;
+    uint8_t *pAC = (uint8_t *)pEnt->usAC;
+
+    if (pEnt->ucMask & 0x01)
+        JPEGHuffChecksumSeg(pEnt->ucDC, DC_TABLE_SIZE/4, &h0, &h1);
+    if (pEnt->ucMask & 0x02)
+        JPEGHuffChecksumSeg(pEnt->ucDC + DC_TABLE_SIZE, DC_TABLE_SIZE/4, &h0, &h1);
+    if (pEnt->ucMask & 0x10)
+        JPEGHuffChecksumSeg(pAC, (HUFF11SIZE*2)/4, &h0, &h1);
+    if (pEnt->ucMask & 0x20)
+        JPEGHuffChecksumSeg(pAC + HUFF11SIZE*2, (HUFF11SIZE*2)/4, &h0, &h1);
+    return h0 ^ (h1 * 0x9e3779b9u);
+} /* JPEGHuffEntryChecksum() */
+//
+// Public runtime configuration (extern so apps/tests can link to them)
+//
+void JPEGHuffCacheFlush(void)
+{
+    int i;
+    for (i = 0; i < JPEG_HUFF_CACHE_MAX; i++)
+    {
+        s_HuffCache[i].ulMagic = 0;
+        s_HuffCache[i].ulLastUse = 0;
+    }
+    s_ulHuffClock = 0;
+} /* JPEGHuffCacheFlush() */
+//
+// Set the number of active cache entries (0 = caching disabled).
+// Returns 0 on success, -1 for an invalid capacity (setting unchanged).
+// Changing the capacity flushes the cache.
+//
+int JPEGHuffCacheSetCapacity(int iCapacity)
+{
+    if (iCapacity < 0 || iCapacity > JPEG_HUFF_CACHE_MAX)
+        return -1; // invalid parameter: keep the current setting
+    s_iHuffCacheCap = iCapacity;
+    JPEGHuffCacheFlush();
+    return 0;
+} /* JPEGHuffCacheSetCapacity() */
+
+int JPEGHuffCacheGetCapacity(void)
+{
+    return s_iHuffCacheCap;
+} /* JPEGHuffCacheGetCapacity() */
+//
+// Bytes of RAM used by the currently active cache entries
+//
+int JPEGHuffCacheGetMemory(void)
+{
+    return s_iHuffCacheCap * (int)sizeof(JPEGHUFFENTRY);
+} /* JPEGHuffCacheGetMemory() */
+//
+// Enable/disable statistics collection (hit rate etc.)
+//
+void JPEGHuffCacheSetStatsEnable(int bEnable)
+{
+    s_iHuffCacheStats = (bEnable != 0);
+} /* JPEGHuffCacheSetStatsEnable() */
+
+void JPEGHuffCacheGetStats(uint32_t *pulHits, uint32_t *pulMisses, uint32_t *pulBuilds, uint32_t *pulCorruptions)
+{
+    if (pulHits) *pulHits = s_ulHuffHits;
+    if (pulMisses) *pulMisses = s_ulHuffMisses;
+    if (pulBuilds) *pulBuilds = s_ulHuffBuilds;
+    if (pulCorruptions) *pulCorruptions = s_ulHuffCorrupt;
+} /* JPEGHuffCacheGetStats() */
+
+void JPEGHuffCacheResetStats(void)
+{
+    s_ulHuffHits = s_ulHuffMisses = 0;
+    s_ulHuffBuilds = s_ulHuffCorrupt = 0;
+} /* JPEGHuffCacheResetStats() */
+//
+// Test/debug hook: expose an entry's expanded-table region so that tests
+// can deliberately corrupt it. Returns NULL for an invalid index.
+//
+uint8_t *JPEGHuffCacheGetEntryData(int iEntry, int *piSize)
+{
+    if (iEntry < 0 || iEntry >= JPEG_HUFF_CACHE_MAX)
+        return NULL;
+    if (piSize)
+        *piSize = (int)(sizeof(s_HuffCache[iEntry].ucDC) + sizeof(s_HuffCache[iEntry].usAC));
+    return s_HuffCache[iEntry].ucDC;
+} /* JPEGHuffCacheGetEntryData() */
+#else // JPEG_HUFF_CACHE_MAX == 0: cache compiled out, provide stubs
+void JPEGHuffCacheFlush(void) {}
+int JPEGHuffCacheSetCapacity(int iCapacity) { return (iCapacity == 0) ? 0 : -1; }
+int JPEGHuffCacheGetCapacity(void) { return 0; }
+int JPEGHuffCacheGetMemory(void) { return 0; }
+void JPEGHuffCacheSetStatsEnable(int bEnable) { (void)bEnable; }
+void JPEGHuffCacheGetStats(uint32_t *pulHits, uint32_t *pulMisses, uint32_t *pulBuilds, uint32_t *pulCorruptions)
+{
+    if (pulHits) *pulHits = 0;
+    if (pulMisses) *pulMisses = 0;
+    if (pulBuilds) *pulBuilds = 0;
+    if (pulCorruptions) *pulCorruptions = 0;
+}
+void JPEGHuffCacheResetStats(void) {}
+uint8_t *JPEGHuffCacheGetEntryData(int iEntry, int *piSize)
+{
+    (void)iEntry;
+    if (piSize) *piSize = 0;
+    return NULL;
+}
+#endif // JPEG_HUFF_CACHE_MAX > 0
+//
+// Build the fast Huffman decode tables, reusing a cached copy of the
+// standard tables when possible. Returns 1 for success, 0 for failure.
+//
+static int JPEGMakeHuffTables(JPEGIMAGE *pJPEG, int bThumbnail)
+{
+#if JPEG_HUFF_CACHE_MAX > 0
+    uint32_t ulFP;
+    int i, iVictim;
+
+    if (s_iHuffCacheCap > 0 && !bThumbnail && pJPEG->ucHuffTableUsed != 0)
+    {
+        ulFP = JPEGHuffFingerprint(pJPEG);
+        for (i = 0; i < s_iHuffCacheCap; i++) // look for a matching entry
+        {
+            JPEGHUFFENTRY *pEnt = &s_HuffCache[i];
+            if (pEnt->ulMagic == JPEG_HUFF_MAGIC &&
+                pEnt->ulFingerprint == ulFP &&
+                pEnt->ucMask == pJPEG->ucHuffTableUsed &&
+                pEnt->ucMode == pJPEG->ucMode)
+            {
+                if (JPEGHuffEntryChecksum(pEnt) != pEnt->ulChecksum)
+                {
+                    // cached data was corrupted: count it, discard the entry
+                    // and fall through to rebuild (and repair) it
+                    if (s_iHuffCacheStats) s_ulHuffCorrupt++;
+                    pEnt->ulMagic = 0;
+                    pEnt->ulLastUse = 0; // make it the next eviction victim
+                    break;
+                }
+                if (!JPEGHuffIsStandard(pJPEG)) // fingerprint collision guard
+                    break; // rebuild without caching
+                JPEGHuffCopySegs(pJPEG->ucHuffDC, (uint8_t *)pJPEG->usHuffAC,
+                                 pEnt->ucDC, (uint8_t *)pEnt->usAC, pEnt->ucMask);
+                pEnt->ulLastUse = ++s_ulHuffClock;
+                if (s_iHuffCacheStats) s_ulHuffHits++;
+                return 1;
+            }
+        }
+        if (JPEGHuffIsStandard(pJPEG)) // a cacheable (standard) table set?
+        {
+            JPEGHUFFENTRY *pEnt;
+            if (s_iHuffCacheStats) s_ulHuffMisses++;
+            if (s_iHuffCacheStats) s_ulHuffBuilds++;
+            if (!JPEGBuildHuffTables(pJPEG, bThumbnail))
+                return 0;
+            // store a copy in the cache (evicting the LRU entry if full)
+            iVictim = 0;
+            for (i = 1; i < s_iHuffCacheCap; i++)
+            {
+                if (s_HuffCache[i].ulLastUse < s_HuffCache[iVictim].ulLastUse)
+                    iVictim = i;
+            }
+            pEnt = &s_HuffCache[iVictim];
+            pEnt->ucMask = pJPEG->ucHuffTableUsed; // set before copy/checksum
+            JPEGHuffCopySegs(pEnt->ucDC, (uint8_t *)pEnt->usAC,
+                             pJPEG->ucHuffDC, (uint8_t *)pJPEG->usHuffAC, pEnt->ucMask);
+            pEnt->ulFingerprint = ulFP;
+            pEnt->ucMode = pJPEG->ucMode;
+            pEnt->ulChecksum = JPEGHuffEntryChecksum(pEnt);
+            pEnt->ulLastUse = ++s_ulHuffClock;
+            pEnt->ulMagic = JPEG_HUFF_MAGIC;
+            return 1;
+        }
+        // custom tables: always rebuilt per frame, never cached
+    }
+    if (s_iHuffCacheStats) s_ulHuffBuilds++;
+    return JPEGBuildHuffTables(pJPEG, bThumbnail);
+#else // cache compiled out: always rebuild
+    return JPEGBuildHuffTables(pJPEG, bThumbnail);
+#endif // JPEG_HUFF_CACHE_MAX > 0
 } /* JPEGMakeHuffTables() */
 
 //
