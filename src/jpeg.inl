@@ -696,26 +696,22 @@ void JPEG_setCropArea(JPEGIMAGE *pJPEG, int x, int y, int w, int h)
         x = 0;
     if (y < 0)
         y = 0;
-    switch (pJPEG->ucSubSample) // set up the parameters for the different subsampling options
+    if (pJPEG->ucNumComponents <= 1) // grayscale (or not yet opened)
     {
-        case 0x00: // fake value to handle grayscale
-        case 0x01: // fake value to handle sRGB/CMYK
-        case 0x11:
-            mcuCX = mcuCY = 8;
-            break;
-        case 0x12:
-            mcuCX = 8;
-            mcuCY = 16;
-            break;
-        case 0x21:
-            mcuCX = 16;
-            mcuCY = 8;
-            break;
-        case 0x22:
-            mcuCX = mcuCY = 16;
-            break;
-        default: // to suppress compiler warning
-            break;
+        mcuCX = mcuCY = 8;
+    }
+    else // derive the MCU size from the component sampling factors
+    {
+        int i, iHMax = 1, iVMax = 1;
+        for (i = 0; i < pJPEG->ucNumComponents; i++)
+        {
+            if (pJPEG->JPCI[i].h_samp_factor > iHMax)
+                iHMax = pJPEG->JPCI[i].h_samp_factor;
+            if (pJPEG->JPCI[i].v_samp_factor > iVMax)
+                iVMax = pJPEG->JPCI[i].v_samp_factor;
+        }
+        mcuCX = iHMax * 8;
+        mcuCY = iVMax * 8;
     }
     if (w & (mcuCX-1)) {
         w &= ~(mcuCX-1);
@@ -1714,10 +1710,15 @@ static int JPEGParseInfo(JPEGIMAGE *pPage, int bExtractThumb)
                         pPage->JPCI[i].component_id = s[iOffset++];
                         pPage->JPCI[i].component_index = (unsigned char)i;
                         ucSamp = s[iOffset++]; // get the h+v sampling factor
+                        if ((ucSamp >> 4) < 1 || (ucSamp >> 4) > 4 || (ucSamp & 0xf) < 1 || (ucSamp & 0xf) > 4)
+                        {
+                            pPage->iError = JPEG_UNSUPPORTED_FEATURE;
+                            return 0; // invalid sampling factors
+                        }
                         if (i == 0) // Y component?
                             pPage->ucSubSample = ucSamp;
-//                        pPage->JPCI[i].h_samp_factor = ucSamp >> 4;
-//                        pPage->JPCI[i].v_samp_factor = ucSamp & 0xf;
+                        pPage->JPCI[i].h_samp_factor = ucSamp >> 4;
+                        pPage->JPCI[i].v_samp_factor = ucSamp & 0xf;
                         pPage->JPCI[i].quant_tbl_no = s[iOffset++]; // quantization table number
                         if (pPage->JPCI[i].quant_tbl_no > 3)
                         {
@@ -4943,6 +4944,198 @@ static void JPEGPutMCU21(JPEGIMAGE *pJPEG, int x, int iPitch)
     }
 } /* JPEGPutMCU21() */
 
+//
+// Compute the MCU layout from the component sampling factors.
+// Fills piOfs with the starting DCT block index of each component
+// within the MCU and returns the total number of blocks per MCU.
+// Also returns the max h/v sampling factors (MCU size = iHMax*8 x iVMax*8).
+//
+static int JPEGGetGenericLayout(JPEGIMAGE *pJPEG, int *piOfs, int *piHMax, int *piVMax)
+{
+    int i, iTotal = 0, iHMax = 1, iVMax = 1;
+
+    for (i = 0; i < pJPEG->ucNumComponents; i++)
+    {
+        int h = pJPEG->JPCI[i].h_samp_factor;
+        int v = pJPEG->JPCI[i].v_samp_factor;
+        piOfs[i] = iTotal;
+        iTotal += h * v;
+        if (h > iHMax) iHMax = h;
+        if (v > iVMax) iVMax = v;
+    }
+    *piHMax = iHMax;
+    *piVMax = iVMax;
+    return iTotal;
+} /* JPEGGetGenericLayout() */
+
+//
+// Decode all of the DCT blocks of one MCU for images with arbitrary
+// sampling factors (e.g. 4:1:1, 4:4:0, mixed per-component factors).
+// The blocks of each component are stored consecutively in the MCU
+// buffer in scan order. Chroma blocks are padded/duplicated as needed
+// by the output stage, which maps each output pixel to its nearest
+// chroma sample according to the sampling factors.
+//
+static int JPEGDecodeMCUGeneric(JPEGIMAGE *pJPEG, int *piCompOfs, int iSkipMask, signed int **ppiDCPred, int bThumbnail)
+{
+    int iErr = 0, c, h, v, iOfs, iM, i, iQuant;
+    uint32_t l, *pl;
+    uint8_t c8;
+    int iOptSave = pJPEG->iOptions;
+
+    // always decode full 8x8 blocks; scaling is handled by the output stage
+    pJPEG->iOptions &= ~(JPEG_SCALE_QUARTER | JPEG_SCALE_EIGHTH);
+    for (c = 0; c < pJPEG->ucNumComponents; c++)
+    {
+        pJPEG->ucACTable = pJPEG->JPCI[c].ac_tbl_no;
+        pJPEG->ucDCTable = pJPEG->JPCI[c].dc_tbl_no;
+        iQuant = pJPEG->sQuantTable[pJPEG->JPCI[c].quant_tbl_no*DCTSIZE]; // DC quant value
+        for (v = 0; v < pJPEG->JPCI[c].v_samp_factor; v++)
+        {
+            for (h = 0; h < pJPEG->JPCI[c].h_samp_factor; h++)
+            {
+                iOfs = (piCompOfs[c] + v * pJPEG->JPCI[c].h_samp_factor + h) * DCTSIZE;
+                iM = iOfs | iSkipMask;
+                if (c > 0 && pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE)
+                    iM = MCU_SKIP; // chroma not needed for grayscale output
+                if (pJPEG->ucMode == 0xc2) // progressive
+                    iErr |= JPEGDecodeMCU_P(pJPEG, iM, ppiDCPred[c]);
+                else
+                    iErr |= JPEGDecodeMCU(pJPEG, iM, ppiDCPred[c]);
+                if (c > 0 && pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE)
+                    continue; // no need to prepare unused chroma pixels
+                if (pJPEG->u16MCUFlags == 0 || bThumbnail) // no AC components, save some time
+                {
+                    c8 = ucRangeTable[((*ppiDCPred[c] * iQuant) >> 5) & 0x3ff];
+                    l = c8 | ((uint32_t)c8 << 8) | ((uint32_t)c8 << 16) | ((uint32_t)c8 << 24);
+                    // dct stores byte values
+                    pl = (uint32_t *)&pJPEG->sMCUs[iOfs];
+                    for (i = 0; i < 16; i++) // 8x8 bytes = 16 longs
+                        pl[i] = l;
+                }
+                else
+                {
+                    JPEGIDCT(pJPEG, iOfs, pJPEG->JPCI[c].quant_tbl_no);
+                }
+            } // for h
+        } // for v
+    } // for c
+    pJPEG->iOptions = iOptSave;
+    return iErr;
+} /* JPEGDecodeMCUGeneric() */
+
+//
+// Color output for arbitrary sampling factors. Each output pixel maps to
+// its nearest Y/Cb/Cr sample according to the per-component sampling
+// factors (the upsampling "kernel" is selected implicitly by the ratio
+// of each component's factors to the maximum factors).
+//
+static void JPEGPutMCUGeneric(JPEGIMAGE *pJPEG, int x, int iPitch)
+{
+    int iOfs[MAX_COMPS_IN_SCAN];
+    int iHMax, iVMax, iScaleShift = 0;
+    int iRow, iCol, mcuCX, mcuCY, iMaxCol, iAdvance = iPitch;
+    int fx, fy, sx, sy, iY, iCb, iCr;
+    int h0, h1, v1, h2, v2;
+    uint8_t *pY, *pCb, *pCr;
+    uint16_t *pOutput = &pJPEG->usPixels[x];
+
+    JPEGGetGenericLayout(pJPEG, iOfs, &iHMax, &iVMax);
+    if (pJPEG->iOptions & JPEG_SCALE_HALF)
+        iScaleShift = 1;
+    else if (pJPEG->iOptions & JPEG_SCALE_QUARTER)
+        iScaleShift = 2;
+    else if (pJPEG->iOptions & JPEG_SCALE_EIGHTH)
+        iScaleShift = 3;
+    mcuCX = (iHMax * 8) >> iScaleShift;
+    mcuCY = (iVMax * 8) >> iScaleShift;
+    if (pJPEG->ucPixelType == RGB8888)
+    {
+        pOutput += x; // 4 bytes per pixel, not 2
+        iAdvance = iPitch * 2;
+    }
+    iMaxCol = mcuCX;
+    if (x + iMaxCol > iPitch) // don't write past the output buffer line
+        iMaxCol = iPitch - x;
+    h0 = pJPEG->JPCI[0].h_samp_factor;
+    h1 = pJPEG->JPCI[1].h_samp_factor; v1 = pJPEG->JPCI[1].v_samp_factor;
+    h2 = pJPEG->JPCI[2].h_samp_factor; v2 = pJPEG->JPCI[2].v_samp_factor;
+    pY  = (uint8_t *)&pJPEG->sMCUs[iOfs[0]*DCTSIZE];
+    pCb = (uint8_t *)&pJPEG->sMCUs[iOfs[1]*DCTSIZE];
+    pCr = (uint8_t *)&pJPEG->sMCUs[iOfs[2]*DCTSIZE];
+    for (iRow = 0; iRow < mcuCY; iRow++)
+    {
+        fy = iRow << iScaleShift;
+        for (iCol = 0; iCol < iMaxCol; iCol++)
+        {
+            fx = iCol << iScaleShift;
+#define YSAMP(XX, YY) pY[((((YY) >> 3) * h0 + ((XX) >> 3)) << 7) + (((YY) & 7) << 3) + ((XX) & 7)]
+            if (iScaleShift == 1) // average 2x2 luma like the other modes
+                iY = (YSAMP(fx, fy) + YSAMP(fx+1, fy) + YSAMP(fx, fy+1) + YSAMP(fx+1, fy+1)) << 10;
+            else
+                iY = YSAMP(fx, fy) << 12;
+            sx = (fx * h1) / iHMax; sy = (fy * v1) / iVMax;
+            iCb = pCb[(((sy >> 3) * h1 + (sx >> 3)) << 7) + ((sy & 7) << 3) + (sx & 7)];
+            sx = (fx * h2) / iHMax; sy = (fy * v2) / iVMax;
+            iCr = pCr[(((sy >> 3) * h2 + (sx >> 3)) << 7) + ((sy & 7) << 3) + (sx & 7)];
+            if (pJPEG->ucPixelType == RGB565_LITTLE_ENDIAN)
+                JPEGPixelLE(pOutput + iCol, iY, iCb, iCr);
+            else if (pJPEG->ucPixelType == RGB565_BIG_ENDIAN)
+                JPEGPixelBE(pOutput + iCol, iY, iCb, iCr);
+            else // RGB8888
+                JPEGPixelRGB((uint32_t *)&pOutput[iCol*2], iY, iCb, iCr);
+        } // for col
+        pOutput += iAdvance;
+    } // for row
+} /* JPEGPutMCUGeneric() */
+
+//
+// Grayscale (luma only) output for arbitrary sampling factors
+//
+static void JPEGPutMCUGenericGray(JPEGIMAGE *pJPEG, int x, int iPitch)
+{
+    int iOfs[MAX_COMPS_IN_SCAN];
+    int iHMax, iVMax, iScaleShift = 0;
+    int iRow, iCol, mcuCX, mcuCY, iMaxCol;
+    int fx, fy, h0;
+    uint8_t *pDest, *pY;
+
+    JPEGGetGenericLayout(pJPEG, iOfs, &iHMax, &iVMax);
+    if (pJPEG->iOptions & JPEG_SCALE_HALF)
+        iScaleShift = 1;
+    else if (pJPEG->iOptions & JPEG_SCALE_QUARTER)
+        iScaleShift = 2;
+    else if (pJPEG->iOptions & JPEG_SCALE_EIGHTH)
+        iScaleShift = 3;
+    mcuCX = (iHMax * 8) >> iScaleShift;
+    mcuCY = (iVMax * 8) >> iScaleShift;
+    if (pJPEG->pDitherBuffer) {
+        pDest = &pJPEG->pDitherBuffer[x];
+    } else {
+        pDest = (uint8_t *)&pJPEG->usPixels[0];
+        pDest += x;
+    }
+    iMaxCol = mcuCX;
+    if (x + iMaxCol > iPitch) // don't write past the output buffer line
+        iMaxCol = iPitch - x;
+    h0 = pJPEG->JPCI[0].h_samp_factor;
+    pY = (uint8_t *)&pJPEG->sMCUs[iOfs[0]*DCTSIZE];
+    for (iRow = 0; iRow < mcuCY; iRow++)
+    {
+        fy = iRow << iScaleShift;
+        for (iCol = 0; iCol < iMaxCol; iCol++)
+        {
+            fx = iCol << iScaleShift;
+            if (iScaleShift == 1) // average 2x2 block
+                pDest[iCol] = (uint8_t)((YSAMP(fx, fy) + YSAMP(fx+1, fy) + YSAMP(fx, fy+1) + YSAMP(fx+1, fy+1) + 2) >> 2);
+            else
+                pDest[iCol] = YSAMP(fx, fy);
+        } // for col
+        pDest += iPitch;
+    } // for row
+#undef YSAMP
+} /* JPEGPutMCUGenericGray() */
+
 // Dither the 8-bit gray pixels into 1, 2, or 4-bit gray
 static void JPEGDither(JPEGIMAGE *pJPEG, int iWidth, int iHeight)
 {
@@ -5023,7 +5216,10 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
 {
     int cx, cy, x, y, mcuCX, mcuCY;
     int iLum0, iLum1, iLum2, iLum3, iCr, iCb;
-    signed int iDCPred0, iDCPred1, iDCPred2;
+    signed int iDCPred0, iDCPred1, iDCPred2, iDCPred3;
+    signed int *piDCPred[4];
+    int iCompOfs[MAX_COMPS_IN_SCAN];
+    int bGeneric = 0; // non-standard subsampling (use generic decode/output)
     int i, iQuant1, iQuant2, iQuant3, iErr;
     int iSkipMask, bSkipRow;
     int iDMASize, iDMAOffset;
@@ -5079,8 +5275,36 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
     cACTable1 = pJPEG->JPCI[1].ac_tbl_no;
     cDCTable2 = pJPEG->JPCI[2].dc_tbl_no;
     cACTable2 = pJPEG->JPCI[2].ac_tbl_no;
-    iDCPred0 = iDCPred1 = iDCPred2 = mcuCX = mcuCY = 0;
-    
+    iDCPred0 = iDCPred1 = iDCPred2 = iDCPred3 = mcuCX = mcuCY = 0;
+    piDCPred[0] = &iDCPred0; piDCPred[1] = &iDCPred1;
+    piDCPred[2] = &iDCPred2; piDCPred[3] = &iDCPred3;
+
+    // Use the generic decode path for any color subsampling which isn't
+    // one of the 4 standard options with 1x1 chroma (e.g. 4:1:1, 4:4:0
+    // with subsampled chroma, or mixed per-component sampling factors)
+    if (pJPEG->ucNumComponents == 3 &&
+        ((pJPEG->ucSubSample != 0x11 && pJPEG->ucSubSample != 0x12 &&
+          pJPEG->ucSubSample != 0x21 && pJPEG->ucSubSample != 0x22) ||
+         pJPEG->JPCI[1].h_samp_factor != 1 || pJPEG->JPCI[1].v_samp_factor != 1 ||
+         pJPEG->JPCI[2].h_samp_factor != 1 || pJPEG->JPCI[2].v_samp_factor != 1))
+        bGeneric = 1;
+
+    if (bGeneric) // set up the MCU layout from the sampling factors
+    {
+        int iHMax, iVMax, iTotalBlocks;
+        iTotalBlocks = JPEGGetGenericLayout(pJPEG, iCompOfs, &iHMax, &iVMax);
+        if (iTotalBlocks > MAX_MCU_COUNT) // too many DCT blocks per MCU
+        {
+            pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+            return 0;
+        }
+        mcuCX = iHMax * 8;
+        mcuCY = iVMax * 8;
+        cx = (pJPEG->iWidth + mcuCX - 1) / mcuCX;  // number of MCU blocks
+        cy = (pJPEG->iCropY + pJPEG->iCropCY + mcuCY - 1) / mcuCY;
+        iCr = iCb = 0; // not used in the generic path
+    }
+    else
     switch (pJPEG->ucSubSample) // set up the parameters for the different subsampling options
     {
         case 0x00: // fake value to handle grayscale
@@ -5115,10 +5339,9 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
             iCb = MCU5;
             mcuCX = mcuCY = 16;
             break;
-        default: // to suppress compiler warning
-            cx = cy = 0;
-            iCr = iCb = 0;
-            break;
+        default: // unsupported subsampling (e.g. invalid component count)
+            pJPEG->iError = JPEG_UNSUPPORTED_FEATURE;
+            return 0;
     }
     // Scale down the MCUs by the requested amount
     mcuCX >>= iScaleShift;
@@ -5210,6 +5433,10 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
             iSkipMask = 0; // assume not skipping
             if (pJPEG->ucMode != 0x52 && (bSkipRow || x*mcuCX < pJPEG->iCropX || x*mcuCX > pJPEG->iCropX+pJPEG->iCropCX)) {
                 iSkipMask = MCU_SKIP;
+            }
+            if (bGeneric) { // decode all blocks of this MCU (arbitrary subsampling)
+                iErr |= JPEGDecodeMCUGeneric(pJPEG, iCompOfs, iSkipMask, piDCPred, bThumbnail);
+                goto mcu_decoded;
             }
             pJPEG->ucACTable = cACTable0;
             pJPEG->ucDCTable = cDCTable0;
@@ -5349,9 +5576,15 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                     }
                 }
             } // if color components present
+mcu_decoded:
             if (!iSkipMask) { // this MCU is not skipped
                 if (pJPEG->ucPixelType >= EIGHT_BIT_GRAYSCALE) {
-                    JPEGPutMCU8BitGray(pJPEG, xoff, iPitch); // grayscale or color is being drawn as grayscale
+                    if (bGeneric)
+                        JPEGPutMCUGenericGray(pJPEG, xoff, iPitch); // grayscale output from arbitrary subsampling
+                    else
+                        JPEGPutMCU8BitGray(pJPEG, xoff, iPitch); // grayscale or color is being drawn as grayscale
+                } else if (bGeneric) {
+                    JPEGPutMCUGeneric(pJPEG, xoff, iPitch); // arbitrary subsampling
                 } else {
                     switch (pJPEG->ucSubSample) {
                         case 0x00: // grayscale
@@ -5415,7 +5648,7 @@ static int DecodeJPEG(JPEGIMAGE *pJPEG)
                 if (--pJPEG->iResCount == 0)
                 {
                     pJPEG->iResCount = pJPEG->iResInterval;
-                    iDCPred0 = iDCPred1 = iDCPred2 = 0; // reset DC predictors
+                    iDCPred0 = iDCPred1 = iDCPred2 = iDCPred3 = 0; // reset DC predictors
                     if (pJPEG->bb.ulBitOff & 7) // need to start at the next even byte
                     {
                         pJPEG->bb.ulBitOff += (8 - (pJPEG->bb.ulBitOff & 7));  // new restart interval starts on byte boundary

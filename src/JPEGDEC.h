@@ -59,7 +59,7 @@
 #define HUFF11SIZE (1<<11)
 #define DC_TABLE_SIZE 1024
 #define DCTSIZE 64
-#define MAX_MCU_COUNT 6
+#define MAX_MCU_COUNT 10 // max DCT blocks per MCU (JPEG spec limit: sum of Hi*Vi <= 10)
 #define MAX_COMPS_IN_SCAN 4
 #define MAX_BUFFERED_PIXELS 2048
 #define MCU_SKIP -8
@@ -166,8 +166,8 @@ typedef struct _jpegcompinfo
 unsigned char component_needed;  /*  do we need the value of this component? */
 unsigned char component_id;     /* identifier for this component (0..255) */
 unsigned char component_index;  /* its index in SOF or cinfo->comp_info[] */
-//unsigned char h_samp_factor;    /* horizontal sampling factor (1..4) */
-//unsigned char v_samp_factor;    /* vertical sampling factor (1..4) */
+unsigned char h_samp_factor;    /* horizontal sampling factor (1..4) */
+unsigned char v_samp_factor;    /* vertical sampling factor (1..4) */
 unsigned char quant_tbl_no;     /* quantization table selector (0..3) */
 // These values may vary between scans
 // For compression, they must be supplied by the user interface
@@ -230,7 +230,7 @@ typedef struct jpeg_image_tag
     uint16_t *usPixels; // needs to be 16-byte aligned for S3 SIMD
     uint16_t usUnalignedPixels[MAX_BUFFERED_PIXELS+8];
     int16_t *sMCUs; // needs to be 16-byte aligned for S3 SIMD
-    int16_t sUnalignedMCUs[8+(DCTSIZE * MAX_MCU_COUNT)]; // 4:2:0 needs 6 DCT blocks per MCU
+    int16_t sUnalignedMCUs[8+(DCTSIZE * MAX_MCU_COUNT)]; // up to 10 DCT blocks per MCU (e.g. 4:1:1, mixed sampling)
     void *pFramebuffer;
     int16_t sQuantTable[DCTSIZE*4]; // quantization tables
     uint8_t ucFileBuf[JPEG_FILE_BUF_SIZE]; // holds temp data and pixel stack
